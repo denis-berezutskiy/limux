@@ -309,7 +309,9 @@ Host prod
         assert!(cmd.contains("ssh"));
         assert!(cmd.contains("'alice@10.0.0.5'"));
         assert!(cmd.contains("-p") && cmd.contains("2222"));
-        assert!(cmd.contains("tmux new -A -s dev"));
+        assert!(cmd.contains("tmux new-session -A -s dev"));
+        assert!(cmd.contains("allow-passthrough on"));
+        assert!(cmd.contains("command -v tmux"));
         assert!(cmd.contains("ServerAliveInterval"));
     }
 

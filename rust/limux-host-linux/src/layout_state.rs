@@ -275,9 +275,16 @@ impl SshConnection {
 
         if self.persist_tmux {
             let session = self.tmux_session_name();
-            // `session` is sanitized to [A-Za-z0-9_-], so it needs no further
-            // remote-side quoting; the whole remote command is passed as one arg.
-            let remote = format!("tmux new -A -s {session}");
+            // `session` is sanitized to [A-Za-z0-9_-], so it needs no remote-side
+            // quoting. This remote command (one shell-quoted arg to ssh):
+            //   * attaches or creates the tmux session (persistence across drops);
+            //   * enables allow-passthrough so OSC notifications emitted by a remote
+            //     agent survive tmux and reach the local terminal;
+            //   * if the remote has no tmux, execs a login shell instead of failing
+            //     (a failure would otherwise trigger an auto-reconnect storm).
+            let remote = format!(
+                "command -v tmux >/dev/null 2>&1 && exec tmux new-session -A -s {session} \\; set -g allow-passthrough on || exec \"${{SHELL:-/bin/sh}}\" -l"
+            );
             command.push(' ');
             command.push_str(&shell_single_quote(&remote));
         }
