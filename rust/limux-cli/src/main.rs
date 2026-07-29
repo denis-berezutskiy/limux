@@ -855,15 +855,177 @@ async fn run_send_key(client: &mut Client, args: &[String]) -> Result<Value> {
     call_in_workspace_scope(client, workspace, "surface.send_key", Value::Object(params)).await
 }
 
+// ---------------------------------------------------------------------------
+// Remote-friendly notification delivery (SSH fallback)
+// ---------------------------------------------------------------------------
+//
+// `limux notify` and the agent hooks normally post `notification.create` over
+// the AF_UNIX control socket at $LIMUX_SOCKET. That socket only exists on the
+// machine running the Limux GUI, so an agent working over SSH has nothing to
+// connect to. Ghostty (the *local* terminal) already turns OSC 9 / OSC 777
+// notification escapes into desktop notifications, and an escape written to the
+// controlling tty of a remote shell rides the SSH PTY back to the local
+// Ghostty. So when the socket send fails we fall back to emitting an OSC 777
+// notification escape on /dev/tty.
+
+/// Build an OSC 777 desktop-notification escape sequence:
+/// `ESC ] 777 ; notify ; <title> ; <body> BEL`.
+///
+/// `title` and `body` are sanitized first so their contents cannot break out
+/// of the sequence: every control character (including ESC `0x1b` and BEL
+/// `0x07`) is dropped, and `;` in the title — which delimits OSC fields — is
+/// replaced with a space.
+fn osc_notification(title: &str, body: &str) -> String {
+    let title = sanitize_osc_field(title, true);
+    let body = sanitize_osc_field(body, false);
+    format!("\x1b]777;notify;{title};{body}\x07")
+}
+
+/// Strip characters that could corrupt or break out of an OSC sequence.
+///
+/// Drops every control character (C0/C1 + DEL, which covers ESC and BEL). When
+/// `replace_semicolons` is set (used for the title field) `;` becomes a space
+/// so it cannot be mistaken for an OSC field delimiter; the body is the final
+/// field so its `;` are left intact.
+fn sanitize_osc_field(text: &str, replace_semicolons: bool) -> String {
+    text.chars()
+        .filter_map(|ch| {
+            if ch.is_control() {
+                None
+            } else if ch == ';' && replace_semicolons {
+                Some(' ')
+            } else {
+                Some(ch)
+            }
+        })
+        .collect()
+}
+
+/// Wrap an escape sequence for tmux DCS passthrough:
+/// `ESC P tmux ; <seq, every ESC doubled> ESC \`.
+///
+/// A remote agent usually runs inside the remote tmux (our persistence layer),
+/// which would otherwise swallow the OSC instead of forwarding it upstream to
+/// the local Ghostty.
+fn wrap_for_tmux(seq: &str) -> String {
+    let doubled = seq.replace('\x1b', "\x1b\x1b");
+    format!("\x1bPtmux;{doubled}\x1b\\")
+}
+
+/// Compose the final bytes to emit: the bare OSC 777 escape, wrapped for tmux
+/// passthrough when running inside tmux.
+fn notification_sequence(title: &str, body: &str, in_tmux: bool) -> String {
+    let osc = osc_notification(title, body);
+    if in_tmux {
+        wrap_for_tmux(&osc)
+    } else {
+        osc
+    }
+}
+
+/// True when we appear to be running inside a tmux client/server ($TMUX set).
+fn in_tmux() -> bool {
+    env::var("TMUX")
+        .map(|value| !value.is_empty())
+        .unwrap_or(false)
+}
+
+/// Emit a notification escape to the controlling terminal.
+///
+/// Writes to `/dev/tty` (never stdout — agent hooks parse their own stdout as
+/// control JSON, so writing there would corrupt the hook protocol). Best
+/// effort: returns `false` when the tty can't be opened or written.
+fn emit_notification_escape(title: &str, body: &str) -> bool {
+    use std::io::Write;
+    let sequence = notification_sequence(title, body, in_tmux());
+    match fs::OpenOptions::new().append(true).open("/dev/tty") {
+        Ok(mut tty) => tty
+            .write_all(sequence.as_bytes())
+            .and_then(|_| tty.flush())
+            .is_ok(),
+        Err(_) => false,
+    }
+}
+
+/// True when notification delivery should skip the socket and emit the OSC
+/// escape directly: the `--osc` flag or `LIMUX_NOTIFY_OSC=1`/`true`.
+fn force_osc_delivery(args: &[String]) -> bool {
+    parse_flag(args, "--osc")
+        || env::var("LIMUX_NOTIFY_OSC")
+            .map(|value| matches!(value.as_str(), "1" | "true"))
+            .unwrap_or(false)
+}
+
+/// Derive the OSC notification body from `notification.create` params, folding
+/// the optional subtitle in front of the body.
+fn osc_body_from_params(params: &Map<String, Value>) -> String {
+    let field = |key: &str| params.get(key).and_then(Value::as_str).unwrap_or_default();
+    let subtitle = field("subtitle");
+    let body = field("body");
+    match (subtitle.is_empty(), body.is_empty()) {
+        (true, _) => body.to_string(),
+        (false, true) => subtitle.to_string(),
+        (false, false) => format!("{subtitle} — {body}"),
+    }
+}
+
+/// Deliver a notification: try the control socket first, then fall back to an
+/// OSC escape on the controlling terminal when the socket can't be reached.
+///
+/// When `force_osc` is set (via `--osc` or `LIMUX_NOTIFY_OSC`) the socket is
+/// skipped entirely. When the socket call succeeds we do *not* also emit the
+/// OSC, so a local notification never fires twice. Only if both the socket and
+/// the tty fall through does the original socket error surface.
+async fn deliver_notification(
+    client: &mut Client,
+    workspace: Option<String>,
+    params: Map<String, Value>,
+    force_osc: bool,
+) -> Result<Value> {
+    let osc_title = params
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let osc_body = osc_body_from_params(&params);
+
+    if force_osc {
+        emit_notification_escape(&osc_title, &osc_body);
+        return Ok(json!({ "delivered": "osc" }));
+    }
+
+    match call_in_workspace_scope(
+        client,
+        workspace,
+        "notification.create",
+        Value::Object(params),
+    )
+    .await
+    {
+        Ok(value) => Ok(value),
+        Err(socket_err) => {
+            if emit_notification_escape(&osc_title, &osc_body) {
+                Ok(json!({ "delivered": "osc" }))
+            } else {
+                Err(socket_err)
+            }
+        }
+    }
+}
+
 /// `limux notify` — post a notification into the sidebar + toast overlay.
 ///
 /// Usage:
-///   limux notify [--workspace <id|ref>] [--surface <id|ref>] [--subtitle <text>] [--body <text>] <title>
+///   limux notify [--workspace <id|ref>] [--surface <id|ref>] [--subtitle <text>] [--body <text>] [--osc] <title>
 ///   limux notify --title "..." --subtitle "..." --body "..."
 ///
 /// Mirrors the `cmux notify` shape (title / subtitle / body). Title is
 /// required; subtitle and body are optional. Falls back to the current
 /// workspace via LIMUX_WORKSPACE_ID when --workspace isn't given.
+///
+/// Delivery goes over the control socket by default; when the socket can't be
+/// reached (e.g. over SSH) it falls back to an OSC 777 terminal notification
+/// escape. `--osc` (or `LIMUX_NOTIFY_OSC=1`) forces that escape path directly.
 fn notification_surface_target(
     args: &[String],
     mut env_value: impl FnMut(&str) -> Option<String>,
@@ -873,7 +1035,6 @@ fn notification_surface_target(
         .or_else(|| env_value("LIMUX_SURFACE_ID"))
         .filter(|value| !value.is_empty())
 }
-
 async fn run_notify(client: &mut Client, args: &[String]) -> Result<Value> {
     let workspace = parse_opt(args, "--workspace")
         .or_else(|| env::var("LIMUX_WORKSPACE_ID").ok())
@@ -903,13 +1064,7 @@ async fn run_notify(client: &mut Client, args: &[String]) -> Result<Value> {
         params.insert("surface_id".to_string(), Value::String(surface));
     }
 
-    call_in_workspace_scope(
-        client,
-        workspace,
-        "notification.create",
-        Value::Object(params),
-    )
-    .await
+    deliver_notification(client, workspace, params, force_osc_delivery(args)).await
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,13 +1207,7 @@ async fn run_agent_hook(
         params.insert("surface_id".to_string(), Value::String(surface));
     }
 
-    let _ = call_in_workspace_scope(
-        client,
-        workspace,
-        "notification.create",
-        Value::Object(params),
-    )
-    .await;
+    let _ = deliver_notification(client, workspace, params, force_osc_delivery(args)).await;
 
     Ok(agent_hook_output(&event, &payload))
 }
@@ -4297,5 +4446,107 @@ mod new_pane_tests {
                 "type": "terminal"
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod notify_escape_tests {
+    use super::*;
+
+    #[test]
+    fn osc_notification_formats_title_and_body() {
+        assert_eq!(
+            osc_notification("Build done", "3 passing"),
+            "\x1b]777;notify;Build done;3 passing\x07"
+        );
+    }
+
+    #[test]
+    fn osc_notification_drops_control_characters() {
+        // Embedded ESC / BEL / newline / tab must not survive: they could
+        // otherwise terminate the sequence early or inject a second one.
+        let seq = osc_notification("a\x1bb\x07c\n", "x\x1by\tz");
+        assert_eq!(seq, "\x1b]777;notify;abc;xyz\x07");
+
+        // The only ESC is the leading framing byte and the only BEL is the
+        // terminator; nothing dangerous survives inside the payload.
+        assert_eq!(seq.matches('\x1b').count(), 1);
+        assert_eq!(seq.matches('\x07').count(), 1);
+        assert!(seq.starts_with("\x1b]777;notify;"));
+        assert!(seq.ends_with('\x07'));
+    }
+
+    #[test]
+    fn osc_notification_neutralizes_semicolon_in_title_only() {
+        // `;` delimits OSC fields, so a title `;` becomes a space; the body is
+        // the final field so its `;` is harmless and left intact.
+        assert_eq!(
+            osc_notification("a;b", "c;d"),
+            "\x1b]777;notify;a b;c;d\x07"
+        );
+    }
+
+    #[test]
+    fn wrap_for_tmux_doubles_esc_and_frames_with_dcs() {
+        let osc = "\x1b]777;notify;hi;yo\x07";
+        assert_eq!(
+            wrap_for_tmux(osc),
+            "\x1bPtmux;\x1b\x1b]777;notify;hi;yo\x07\x1b\\"
+        );
+
+        let wrapped = wrap_for_tmux(osc);
+        assert!(wrapped.starts_with("\x1bPtmux;"));
+        assert!(wrapped.ends_with("\x1b\\"));
+        // Every inner ESC is doubled, plus the framing ESC and the ST's ESC.
+        assert_eq!(
+            wrapped.matches('\x1b').count(),
+            osc.matches('\x1b').count() * 2 + 2
+        );
+    }
+
+    #[test]
+    fn wrap_for_tmux_doubles_a_lone_esc() {
+        assert_eq!(wrap_for_tmux("\x1b"), "\x1bPtmux;\x1b\x1b\x1b\\");
+    }
+
+    #[test]
+    fn notification_sequence_is_bare_osc_outside_tmux() {
+        assert_eq!(
+            notification_sequence("t", "b", false),
+            osc_notification("t", "b")
+        );
+        assert!(!notification_sequence("t", "b", false).starts_with("\x1bP"));
+    }
+
+    #[test]
+    fn notification_sequence_is_tmux_wrapped_inside_tmux() {
+        let inner = osc_notification("t", "b");
+        assert_eq!(notification_sequence("t", "b", true), wrap_for_tmux(&inner));
+
+        let seq = notification_sequence("t", "b", true);
+        assert!(seq.starts_with("\x1bPtmux;"));
+        assert!(seq.ends_with("\x1b\\"));
+    }
+
+    #[test]
+    fn osc_body_from_params_folds_subtitle_and_body() {
+        let both = json!({ "subtitle": "sess-1234", "body": "waiting for input" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let folded = osc_body_from_params(&both);
+        assert!(folded.starts_with("sess-1234"));
+        assert!(folded.ends_with("waiting for input"));
+
+        let body_only = json!({ "body": "done" }).as_object().unwrap().clone();
+        assert_eq!(osc_body_from_params(&body_only), "done");
+
+        let subtitle_only = json!({ "subtitle": "sess-1234" })
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(osc_body_from_params(&subtitle_only), "sess-1234");
+
+        assert_eq!(osc_body_from_params(&Map::new()), "");
     }
 }
