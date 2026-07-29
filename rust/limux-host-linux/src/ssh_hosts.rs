@@ -312,6 +312,7 @@ Host prod
         assert!(cmd.contains("tmux new-session -A -s dev"));
         assert!(cmd.contains("allow-passthrough on"));
         assert!(cmd.contains("command -v tmux"));
+        assert!(cmd.contains("TERM=xterm-256color"));
         assert!(cmd.contains("ServerAliveInterval"));
     }
 

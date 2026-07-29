@@ -277,13 +277,16 @@ impl SshConnection {
             let session = self.tmux_session_name();
             // `session` is sanitized to [A-Za-z0-9_-], so it needs no remote-side
             // quoting. This remote command (one shell-quoted arg to ssh):
+            //   * falls back to TERM=xterm-256color when the remote lacks Ghostty's
+            //     terminfo, so tmux doesn't abort with "missing or unsuitable
+            //     terminal: xterm-ghostty" (ssh forwards the local TERM);
             //   * attaches or creates the tmux session (persistence across drops);
             //   * enables allow-passthrough so OSC notifications emitted by a remote
             //     agent survive tmux and reach the local terminal;
             //   * if the remote has no tmux, execs a login shell instead of failing
             //     (a failure would otherwise trigger an auto-reconnect storm).
             let remote = format!(
-                "command -v tmux >/dev/null 2>&1 && exec tmux new-session -A -s {session} \\; set -g allow-passthrough on || exec \"${{SHELL:-/bin/sh}}\" -l"
+                "infocmp xterm-ghostty >/dev/null 2>&1 || export TERM=xterm-256color; command -v tmux >/dev/null 2>&1 && exec tmux new-session -A -s {session} \\; set -g allow-passthrough on || exec \"${{SHELL:-/bin/sh}}\" -l"
             );
             command.push(' ');
             command.push_str(&shell_single_quote(&remote));

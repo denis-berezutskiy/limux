@@ -1699,19 +1699,29 @@ fn handle_terminal_exit(
                 .as_ref()
                 .expect("Reconnect action implies an SSH connection")
                 .reconnect_command();
+            // Capped exponential backoff between reconnects. Beyond politeness this
+            // gives the surface/PTY time to settle: right after an app launch the
+            // first ssh can exit spuriously before the pane is realized, and an
+            // instant respawn would hammer it up to the storm cap. Spacing the
+            // retries (0.2s, 0.4s, 0.8s, 1.6s, 3.2s) lets it stabilize.
+            let delay_ms = (200u64 << fast_fail_count.saturating_sub(1).min(4)).min(3200);
             eprintln!(
                 "limux: ssh pane surface={pane_id}:{tab_id} exited (code={exit_code:?}); \
-                 auto-reconnecting (fast_fail_count={fast_fail_count})"
+                 auto-reconnecting in {delay_ms}ms (fast_fail_count={fast_fail_count})"
             );
-            respawn_terminal_tab(
-                &internals,
-                tab_id,
-                command,
-                ReconnectBookkeeping {
-                    fast_fail_count,
-                    last_spawn: Some(now),
-                },
-            );
+            let internals = internals.clone();
+            let tab_id = tab_id.to_string();
+            glib::timeout_add_local_once(Duration::from_millis(delay_ms), move || {
+                respawn_terminal_tab(
+                    &internals,
+                    &tab_id,
+                    command,
+                    ReconnectBookkeeping {
+                        fast_fail_count,
+                        last_spawn: Some(Instant::now()),
+                    },
+                );
+            });
         }
         ExitAction::GiveUp => {
             eprintln!(
