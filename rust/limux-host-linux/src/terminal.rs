@@ -10,7 +10,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::os::unix::ffi::OsStringExt;
 use std::ptr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -58,6 +58,18 @@ type VoidCallback = dyn Fn();
 type CloseCallback = dyn Fn(Option<i32>);
 type WidgetCallback = dyn Fn(&gtk::Widget);
 type IdentityCallback = dyn Fn() -> TerminalIdentity;
+/// Injects an already-resolved path (with a trailing space) into the terminal
+/// surface, on the GTK main thread. The terminal builds this because it owns
+/// the ghostty surface; it hands it to the pane layer so the pane can call it
+/// once the final path is known — immediately for a local pane, or after an
+/// scp upload for an SSH pane.
+type PastedPathInjector = Box<dyn Fn(String)>;
+/// Resolve a freshly-written local PNG (produced by an image paste) into the
+/// path text to inject, then inject it via the supplied [`PastedPathInjector`].
+/// The pane layer owns this decision so the terminal stays free of SSH
+/// specifics: a local pane injects the local temp-file path, while an SSH pane
+/// uploads the file to the remote host and injects the remote path instead.
+type ResolvePastedImageCallback = dyn Fn(std::path::PathBuf, PastedPathInjector);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LinkOpenRequest {
@@ -1264,6 +1276,121 @@ fn clipboard_formats_include_text<'a>(
     })
 }
 
+/// Serial counter so two image pastes in the same nanosecond still get distinct
+/// temp files; combined with the pid and wall-clock nanos in the file name it
+/// is unique across processes and calls.
+static PASTED_IMAGE_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+/// True when this key event is a clipboard-paste chord (Ctrl+V or Ctrl+Shift+V)
+/// that Limux should inspect for image content before ghostty treats it as a
+/// text paste. Alt/Super disqualify it so unrelated chords fall through.
+fn is_image_paste_chord(keyval: gtk::gdk::Key, modifier: gtk::gdk::ModifierType) -> bool {
+    let ctrl = modifier.contains(gtk::gdk::ModifierType::CONTROL_MASK);
+    let alt = modifier.contains(gtk::gdk::ModifierType::ALT_MASK);
+    let sup = modifier.contains(gtk::gdk::ModifierType::SUPER_MASK);
+    ctrl && !alt && !sup && matches!(keyval, gtk::gdk::Key::v | gtk::gdk::Key::V)
+}
+
+/// If the default clipboard currently offers an image, asynchronously read it
+/// (texture → PNG → temp file → resolve/inject) and return `true` so the caller
+/// consumes the paste chord. When there is no image, return `false` so ghostty
+/// performs its normal text paste. All work stays on the GTK main thread; the
+/// `read_texture_async` completion closure also runs on the main thread.
+fn try_begin_image_paste(
+    surface_cell: &Rc<RefCell<Option<ghostty_surface_t>>>,
+    callbacks: &Rc<RefCell<TerminalCallbacks>>,
+) -> bool {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return false;
+    };
+    let clipboard = display.clipboard();
+    let mime_types = clipboard.formats().mime_types();
+    if !clipboard_formats_include_image(mime_types.iter().map(|mime| mime.as_str())) {
+        return false;
+    }
+
+    let surface_cell = surface_cell.clone();
+    let callbacks = callbacks.clone();
+    clipboard.read_texture_async(gtk::gio::Cancellable::NONE, move |result| {
+        let texture = match result {
+            Ok(Some(texture)) => texture,
+            Ok(None) => {
+                eprintln!("limux: image paste: clipboard offered no texture");
+                return;
+            }
+            Err(err) => {
+                eprintln!("limux: image paste: failed to read clipboard texture: {err}");
+                return;
+            }
+        };
+        let png = texture.save_to_png_bytes();
+        let Some(path) = write_pasted_image_png(&png) else {
+            return;
+        };
+        let inject_surface_cell = surface_cell.clone();
+        let inject: PastedPathInjector = Box::new(move |resolved: String| {
+            inject_pasted_image_path(&inject_surface_cell, &resolved);
+        });
+        (callbacks.borrow().resolve_pasted_image)(path, inject);
+    });
+    true
+}
+
+/// A unique `limux-paste-<token>.png` name. The token only ever contains digits
+/// and hyphens, so the bare name never needs shell-quoting on its own.
+fn pasted_image_file_name() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let serial = PASTED_IMAGE_SERIAL.fetch_add(1, Ordering::Relaxed);
+    format!("limux-paste-{}-{nanos}-{serial}.png", std::process::id())
+}
+
+/// Write the pasted PNG to a uniquely named temp file and return its path.
+///
+/// The file is intentionally NOT deleted here: the resolver (and, for SSH
+/// panes, the background scp) still needs to read it after this returns, and an
+/// agent reading the injected path expects the file to persist. (cmux
+/// historically unlinked these too early, breaking the paste it shipped.)
+fn write_pasted_image_png(bytes: &[u8]) -> Option<std::path::PathBuf> {
+    let path = std::env::temp_dir().join(pasted_image_file_name());
+    match std::fs::write(&path, bytes) {
+        Ok(()) => Some(path),
+        Err(err) => {
+            eprintln!(
+                "limux: image paste: failed to write {}: {err}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Shell-escape `path` and inject it (with a trailing space) into the surface,
+/// reusing the same escaping + `ghostty_surface_text` mechanism as the file
+/// drag-and-drop path. Reads the surface afresh so a pane closed during an
+/// async scp becomes a harmless no-op.
+fn inject_pasted_image_path(surface_cell: &Rc<RefCell<Option<ghostty_surface_t>>>, path: &str) {
+    let Some(surface) = *surface_cell.borrow() else {
+        return;
+    };
+    let Some(text) = shell_escape_path_with_trailing_space(path.as_bytes()) else {
+        return;
+    };
+    unsafe {
+        ghostty_surface_text(surface, text.as_ptr(), text.as_bytes().len());
+    }
+}
+
+/// Bash-escape a single path and append a trailing space, so the injected text
+/// leaves the cursor ready for the next argument (matching how a dropped file
+/// path lands with a separator before subsequent typing).
+fn shell_escape_path_with_trailing_space(path: &[u8]) -> Option<CString> {
+    let mut text = shell_escape_bytes(path);
+    text.push(b' ');
+    CString::new(text).ok()
+}
 fn clipboard_write_policy(
     clipboard_type: c_int,
     copy_selection_to_clipboard: bool,
@@ -1317,6 +1444,10 @@ pub struct TerminalCallbacks {
     pub on_split_down: Box<VoidCallback>,
     pub on_open_keybinds: Box<WidgetCallback>,
     pub identity: Box<IdentityCallback>,
+    /// Resolve + inject the path for a pasted clipboard image. Called on the
+    /// GTK main thread with the local PNG the terminal just wrote and the
+    /// injection closure it should ultimately be handed to.
+    pub resolve_pasted_image: Box<ResolvePastedImageCallback>,
 }
 
 impl TerminalCallbacks {
@@ -1336,6 +1467,7 @@ impl TerminalCallbacks {
                 workspace_id: None,
                 surface_id: String::new(),
             }),
+            resolve_pasted_image: Box::new(|_, _| {}),
         }
     }
 }
@@ -1838,8 +1970,19 @@ pub fn create_terminal(
         let sc_release = surface_cell.clone();
         let pane_ime_press = pane_ime.clone();
         let pane_ime_release = pane_ime.clone();
+        let callbacks_for_paste = callbacks.clone();
         let key_controller = gtk::EventControllerKey::new();
         key_controller.connect_key_pressed(move |ctrl, keyval, keycode, modifier| {
+            // Intercept the paste chord for IMAGE clipboards only. Ghostty owns
+            // the ordinary text paste (its own Ctrl+V keybinding), so we forward
+            // anything that is not an image untouched. `try_begin_image_paste`
+            // returns false when the clipboard has no image, leaving text paste
+            // exactly as before.
+            if is_image_paste_chord(keyval, modifier)
+                && try_begin_image_paste(&sc_press, &callbacks_for_paste)
+            {
+                return glib::Propagation::Stop;
+            }
             if let Some(surface) = *sc_press.borrow() {
                 let current_event = ctrl
                     .current_event()
@@ -3195,6 +3338,61 @@ mod tests {
             ["text/plain", "text/plain;charset=utf-8"]
         ));
         assert!(clipboard_formats_include_image(["image/png", "text/plain"]));
+    }
+
+    #[test]
+    fn is_image_paste_chord_matches_ctrl_v_and_ctrl_shift_v() {
+        use gtk::gdk::ModifierType;
+        assert!(is_image_paste_chord(
+            gtk::gdk::Key::v,
+            ModifierType::CONTROL_MASK
+        ));
+        assert!(is_image_paste_chord(
+            gtk::gdk::Key::V,
+            ModifierType::CONTROL_MASK | ModifierType::SHIFT_MASK
+        ));
+    }
+
+    #[test]
+    fn is_image_paste_chord_rejects_non_paste_chords() {
+        use gtk::gdk::ModifierType;
+        // Plain 'v' with no Ctrl is typing, not a paste.
+        assert!(!is_image_paste_chord(
+            gtk::gdk::Key::v,
+            ModifierType::empty()
+        ));
+        // Ctrl+C is not paste.
+        assert!(!is_image_paste_chord(
+            gtk::gdk::Key::c,
+            ModifierType::CONTROL_MASK
+        ));
+        // Alt/Super disqualify the chord.
+        assert!(!is_image_paste_chord(
+            gtk::gdk::Key::v,
+            ModifierType::CONTROL_MASK | ModifierType::ALT_MASK
+        ));
+        assert!(!is_image_paste_chord(
+            gtk::gdk::Key::v,
+            ModifierType::CONTROL_MASK | ModifierType::SUPER_MASK
+        ));
+    }
+
+    #[test]
+    fn shell_escape_path_with_trailing_space_appends_space() {
+        let escaped = shell_escape_path_with_trailing_space(b"/tmp/limux-paste-1.png").unwrap();
+        assert_eq!(escaped.to_bytes(), b"/tmp/limux-paste-1.png ");
+        // A path with a space is quoted AND still gets the trailing separator.
+        let escaped = shell_escape_path_with_trailing_space(b"/tmp/my paste.png").unwrap();
+        assert_eq!(escaped.to_bytes(), b"$'/tmp/my paste.png' ");
+    }
+
+    #[test]
+    fn pasted_image_file_name_is_unique_png() {
+        let a = pasted_image_file_name();
+        let b = pasted_image_file_name();
+        assert!(a.starts_with("limux-paste-"), "got {a}");
+        assert!(a.ends_with(".png"), "got {a}");
+        assert_ne!(a, b, "serial counter must make names unique");
     }
 
     #[test]

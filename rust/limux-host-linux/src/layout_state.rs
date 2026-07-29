@@ -283,6 +283,47 @@ impl SshConnection {
         }
         command
     }
+
+    /// A unique remote path to upload a pasted image to before injecting it
+    /// into the remote shell. After the fixed prefix it is composed only of
+    /// digits and hyphens, so it is inherently shell-safe (nothing to sanitize).
+    pub fn remote_paste_path(&self) -> String {
+        format!("/tmp/limux-paste-{}.png", paste_upload_token())
+    }
+
+    /// Build the `scp` command that uploads `local_path` to `remote_path` on
+    /// this connection's host. Mirrors [`reconnect_command`](Self::reconnect_command)
+    /// flag handling but with scp's spelling: `-P` (capital) for the port,
+    /// `-i` for the identity file, and `-o ProxyJump=<host>` for a jump host
+    /// (scp has no `-J`). Every argument is single-quoted just like the
+    /// reconnect command, so the whole string is safe to hand to a shell.
+    pub fn scp_command(&self, local_path: &str, remote_path: &str) -> String {
+        let mut parts: Vec<String> = vec!["scp".to_string()];
+        if let Some(port) = self.port {
+            parts.push("-P".to_string());
+            parts.push(port.to_string());
+        }
+        if let Some(identity) = self.identity_file.as_deref().and_then(normalized_str) {
+            parts.push("-i".to_string());
+            parts.push(identity);
+        }
+        if let Some(proxy) = self.proxy_jump.as_deref().and_then(normalized_str) {
+            parts.push("-o".to_string());
+            parts.push(format!("ProxyJump={proxy}"));
+        }
+        parts.push(local_path.to_string());
+        let target = match self.user.as_deref().and_then(normalized_str) {
+            Some(user) => format!("{user}@{}:{remote_path}", self.host),
+            None => format!("{}:{remote_path}", self.host),
+        };
+        parts.push(target);
+
+        parts
+            .iter()
+            .map(|part| shell_single_quote(part))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -1044,6 +1085,20 @@ fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// A unique token (pid + wall-clock nanos + serial) for naming a pasted-image
+/// upload. Only digits and hyphens, so it needs no shell escaping. The serial
+/// keeps two pastes in the same nanosecond from colliding.
+fn paste_upload_token() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SERIAL: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{nanos}-{serial}", std::process::id())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1077,6 +1132,75 @@ mod tests {
                 None => unsafe { std::env::remove_var(self.key) },
             }
         }
+    }
+
+    fn ssh_conn(
+        host: &str,
+        user: Option<&str>,
+        port: Option<u16>,
+        identity: Option<&str>,
+        proxy: Option<&str>,
+    ) -> SshConnection {
+        SshConnection {
+            host: host.to_string(),
+            user: user.map(str::to_string),
+            port,
+            identity_file: identity.map(str::to_string),
+            proxy_jump: proxy.map(str::to_string),
+            remote_session_name: None,
+            persist_tmux: true,
+            auto_reconnect: true,
+        }
+    }
+
+    #[test]
+    fn scp_command_uses_capital_p_port_identity_and_user_target() {
+        let conn = ssh_conn(
+            "example.com",
+            Some("alice"),
+            Some(2222),
+            Some("/home/alice/.ssh/id_ed25519"),
+            None,
+        );
+        let cmd = conn.scp_command("/tmp/limux-paste-1.png", "/tmp/limux-paste-remote.png");
+
+        assert!(cmd.starts_with("'scp'"), "cmd={cmd}");
+        // scp spells the port -P (capital), unlike ssh's -p.
+        assert!(cmd.contains("'-P' '2222'"), "cmd={cmd}");
+        assert!(!cmd.contains("'-p'"), "cmd={cmd}");
+        assert!(
+            cmd.contains("'-i' '/home/alice/.ssh/id_ed25519'"),
+            "cmd={cmd}"
+        );
+        assert!(cmd.contains("'/tmp/limux-paste-1.png'"), "cmd={cmd}");
+        assert!(
+            cmd.contains("'alice@example.com:/tmp/limux-paste-remote.png'"),
+            "cmd={cmd}"
+        );
+    }
+
+    #[test]
+    fn scp_command_uses_proxy_jump_option_and_bare_host() {
+        let conn = ssh_conn("host", None, None, None, Some("jump.example"));
+        let cmd = conn.scp_command("/l.png", "/r.png");
+
+        // scp has no -J; it takes the ProxyJump ssh option instead.
+        assert!(cmd.contains("'-o' 'ProxyJump=jump.example'"), "cmd={cmd}");
+        assert!(!cmd.contains("'-J'"), "cmd={cmd}");
+        // No user configured -> bare host target, no '@'.
+        assert!(cmd.contains("'host:/r.png'"), "cmd={cmd}");
+        assert!(!cmd.contains('@'), "cmd={cmd}");
+    }
+
+    #[test]
+    fn remote_paste_path_is_unique_png_under_tmp() {
+        let conn = ssh_conn("host", None, None, None, None);
+        let a = conn.remote_paste_path();
+        let b = conn.remote_paste_path();
+
+        assert!(a.starts_with("/tmp/limux-paste-"), "a={a}");
+        assert!(a.ends_with(".png"), "a={a}");
+        assert_ne!(a, b, "each remote paste path must be unique");
     }
 
     #[test]

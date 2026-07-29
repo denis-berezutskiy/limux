@@ -1398,6 +1398,93 @@ fn make_terminal_callbacks(
                 }
             }
         }),
+        resolve_pasted_image: Box::new({
+            // Capture only the pane id (Copy) + tab id, and re-look-up the pane
+            // via the weak registry — same as `on_close` — so this callback,
+            // which the terminal handle owns, never forms an Rc cycle back to
+            // `PaneInternals`.
+            let tab_id = tab_id.to_string();
+            move |local_png, inject| {
+                resolve_pasted_image_for_tab(pane_id, &tab_id, local_png, inject);
+            }
+        }),
+    }
+}
+
+/// Resolve the path to inject for an image paste into pane `pane_id`'s tab
+/// `tab_id`, then hand it to `inject` (which runs on the GTK main thread).
+///
+/// A local pane injects the local temp-file path immediately. An SSH pane
+/// uploads the file to the remote host with scp on a background thread (scp is
+/// blocking — it must never run on the GTK main loop) and, on success, injects
+/// the REMOTE path back on the main thread via `MainContext::spawn_local`. On
+/// scp failure nothing is injected.
+fn resolve_pasted_image_for_tab(
+    pane_id: u32,
+    tab_id: &str,
+    local_png: std::path::PathBuf,
+    inject: Box<dyn Fn(String)>,
+) {
+    let Some(internals) = lookup_pane_internals(pane_id) else {
+        return;
+    };
+    // Read this tab's SSH target, mirroring `handle_terminal_exit`.
+    let ssh = {
+        let ts = internals.tab_state.borrow();
+        let Some(entry) = ts.tabs.iter().find(|e| e.id == tab_id) else {
+            return;
+        };
+        let TabKind::Terminal { state } = &entry.kind else {
+            return;
+        };
+        state.ssh.clone()
+    };
+
+    let local_path = local_png.to_string_lossy().into_owned();
+
+    let Some(conn) = ssh else {
+        // Local pane: the temp PNG path is directly usable as-is.
+        inject(local_path);
+        return;
+    };
+
+    // SSH pane: upload the file off the GTK main loop, then inject the remote
+    // path on success. Only the scp subprocess runs off-thread; the `inject`
+    // closure (which touches the non-Send ghostty surface) stays on the main
+    // thread inside the spawn_local future.
+    let remote_path = conn.remote_paste_path();
+    let scp = conn.scp_command(&local_path, &remote_path);
+    glib::MainContext::default().spawn_local(async move {
+        match gtk::gio::spawn_blocking(move || run_scp_command(&scp)).await {
+            Ok(true) => inject(remote_path),
+            Ok(false) => {
+                eprintln!("limux: image paste: scp to {remote_path} failed; not injecting a path");
+            }
+            Err(_) => {
+                eprintln!("limux: image paste: scp task panicked; not injecting a path");
+            }
+        }
+    });
+}
+
+/// Run a shell-quoted scp command (as built by [`SshConnection::scp_command`])
+/// to completion, returning whether it succeeded. Invoked on a background
+/// thread via `gio::spawn_blocking`; scp is blocking and must not run on the
+/// GTK main loop. scp's own stderr is inherited so upload errors are visible.
+fn run_scp_command(command: &str) -> bool {
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(err) => {
+            eprintln!("limux: image paste: failed to spawn scp: {err}");
+            false
+        }
     }
 }
 
