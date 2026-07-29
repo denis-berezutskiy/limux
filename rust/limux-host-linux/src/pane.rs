@@ -22,7 +22,7 @@ use webkit6::prelude::*;
 use crate::app_config::{AppConfig, LinkOpenDestination};
 use crate::keybind_editor;
 use crate::layout_state::{
-    PaneState, RestorableAgentState, TabContentState, TabState as SavedTabState,
+    PaneState, RestorableAgentState, SshConnection, TabContentState, TabState as SavedTabState,
 };
 use crate::link_uri;
 use crate::settings_editor;
@@ -266,6 +266,9 @@ pub struct PaneCallbacks {
 struct TerminalTabState {
     cwd: Rc<RefCell<Option<String>>>,
     handle: terminal::TerminalHandle,
+    /// Present when this tab is an SSH session; drives snapshot persistence
+    /// and auto-reconnect on child exit.
+    ssh: Option<SshConnection>,
 }
 
 #[derive(Clone)]
@@ -1082,6 +1085,7 @@ struct TerminalTabOptions<'a> {
     pinned: bool,
     cwd: Option<&'a str>,
     agent: Option<RestorableAgentState>,
+    ssh: Option<SshConnection>,
 }
 
 struct BrowserTabOptions<'a> {
@@ -1115,7 +1119,7 @@ fn restore_tabs_from_state(
 
     for saved_tab in &saved_state.tabs {
         match &saved_tab.content {
-            TabContentState::Terminal { cwd, agent } => add_terminal_tab_inner(
+            TabContentState::Terminal { cwd, agent, ssh } => add_terminal_tab_inner(
                 internals,
                 cwd.as_deref().or(working_directory),
                 Some(TerminalTabOptions {
@@ -1124,6 +1128,7 @@ fn restore_tabs_from_state(
                     pinned: saved_tab.pinned,
                     cwd: cwd.as_deref().or(working_directory),
                     agent: agent.clone(),
+                    ssh: ssh.as_deref().cloned(),
                 }),
             ),
             TabContentState::Browser { uri } => add_browser_tab_inner(
@@ -1459,13 +1464,29 @@ fn add_terminal_tab_inner(
     {
         extra_env.push(("LIMUX_SOCKET".to_string(), sock.to_string()));
     }
-    let restored_agent_command = options
+    // An SSH connection takes precedence over an agent: a tab is one or the
+    // other, and if both were somehow present the remote session (which may
+    // itself host the agent) is what we want to re-establish. Either way this
+    // restored command takes precedence over a workspace autostart command,
+    // just as a resumed agent does.
+    let ssh_connection = options.as_ref().and_then(|value| value.ssh.clone());
+    let restored_agent_command = ssh_connection
         .as_ref()
-        .and_then(|value| value.agent.as_ref())
-        .and_then(|agent| agent.resume_command());
+        .map(|ssh| ssh.reconnect_command())
+        .or_else(|| {
+            options
+                .as_ref()
+                .and_then(|value| value.agent.as_ref())
+                .and_then(|agent| agent.resume_command())
+        });
     if let Some(command) = restored_agent_command.as_deref() {
+        let kind = if ssh_connection.is_some() {
+            "ssh"
+        } else {
+            "agent"
+        };
         eprintln!(
-            "limux: restoring agent terminal surface={}:{} command={}",
+            "limux: spawning {kind} terminal surface={}:{} command={}",
             internals.pane_id, tab_id, command
         );
     }
@@ -1523,6 +1544,7 @@ fn add_terminal_tab_inner(
                 state: TerminalTabState {
                     cwd: term_cwd.clone(),
                     handle: term.handle.clone(),
+                    ssh: ssh_connection.clone(),
                 },
             },
         });
@@ -1928,6 +1950,7 @@ pub fn snapshot_pane_state(pane_widget: &gtk::Widget) -> Option<PaneState> {
                 TabKind::Terminal { state } => TabContentState::Terminal {
                     cwd: state.cwd.borrow().clone(),
                     agent: None,
+                    ssh: state.ssh.clone().map(Box::new),
                 },
                 TabKind::Browser { state } => TabContentState::Browser {
                     uri: state.uri.borrow().clone(),

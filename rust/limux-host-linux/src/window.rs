@@ -80,6 +80,11 @@ pub(crate) struct AppState {
     sidebar_shell: gtk::Box,
     sidebar_handle: gtk::Box,
     new_ws_btn: gtk::Button,
+    /// Separate ListBox for the "SSH HOSTS" section. Its rows map by index into
+    /// `ssh_hosts`; it must never be confused with `sidebar_list`, whose rows map
+    /// to `workspaces` by index.
+    ssh_list: gtk::ListBox,
+    ssh_hosts: Vec<crate::ssh_hosts::SshHost>,
     sidebar_animation: Option<adw::TimedAnimation>,
     sidebar_animation_epoch: u64,
     sidebar_expanded_width: i32,
@@ -1704,6 +1709,44 @@ pub fn build_window(app: &adw::Application) {
     }
     new_ws_btn.add_controller(btn_drop.clone());
 
+    // "SSH HOSTS" section. Its own ListBox (rows map by index into
+    // AppState::ssh_hosts) so it never collides with the workspace sidebar_list.
+    let ssh_list = gtk::ListBox::new();
+    ssh_list.set_selection_mode(gtk::SelectionMode::None);
+    ssh_list.add_css_class("navigation-sidebar");
+
+    let ssh_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .propagate_natural_height(true)
+        .max_content_height(220)
+        .child(&ssh_list)
+        .build();
+
+    let ssh_title_label = gtk::Label::builder()
+        .label("SSH HOSTS")
+        .xalign(0.0)
+        .hexpand(true)
+        .margin_start(12)
+        .build();
+    ssh_title_label.add_css_class("limux-sidebar-title");
+
+    let ssh_add_btn = gtk::Button::builder()
+        .label("+")
+        .tooltip_text("Add SSH host")
+        .build();
+    ssh_add_btn.add_css_class("flat");
+    ssh_add_btn.set_focus_on_click(false);
+
+    let ssh_title = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .margin_top(8)
+        .margin_bottom(4)
+        .margin_end(6)
+        .build();
+    ssh_title.append(&ssh_title_label);
+    ssh_title.append(&ssh_add_btn);
+
     let sidebar = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(4)
@@ -1712,6 +1755,8 @@ pub fn build_window(app: &adw::Application) {
     sidebar.append(&sidebar_title);
     sidebar.append(&sidebar_scroll);
     sidebar.append(&new_ws_btn);
+    sidebar.append(&ssh_title);
+    sidebar.append(&ssh_scroll);
 
     let (main_split, sidebar_shell, sidebar_handle) = build_sidebar_split(&sidebar, &stack);
 
@@ -1738,6 +1783,8 @@ pub fn build_window(app: &adw::Application) {
         sidebar_shell: sidebar_shell.clone(),
         sidebar_handle: sidebar_handle.clone(),
         new_ws_btn: new_ws_btn.clone(),
+        ssh_list: ssh_list.clone(),
+        ssh_hosts: crate::ssh_hosts::all_hosts(),
         sidebar_animation: None,
         sidebar_animation_epoch: 0,
         sidebar_expanded_width: SIDEBAR_WIDTH,
@@ -1862,6 +1909,26 @@ pub fn build_window(app: &adw::Application) {
         let state = state.clone();
         new_ws_btn.connect_clicked(move |_| {
             add_workspace(&state, None);
+        });
+    }
+
+    refresh_ssh_hosts(&state);
+
+    {
+        let state = state.clone();
+        ssh_add_btn.connect_clicked(move |_| {
+            show_ssh_host_dialog(&state, None);
+        });
+    }
+
+    {
+        let state = state.clone();
+        ssh_list.connect_row_activated(move |_, row| {
+            let idx = row.index() as usize;
+            let host = state.borrow().ssh_hosts.get(idx).cloned();
+            if let Some(host) = host {
+                connect_ssh_host(&state, &host);
+            }
         });
     }
 
@@ -2319,6 +2386,10 @@ fn dispatch_shortcut_command(state: &State, command: ShortcutCommand) -> bool {
     match command {
         ShortcutCommand::NewWorkspace => {
             add_workspace(state, None);
+            true
+        }
+        ShortcutCommand::OpenSshManager => {
+            show_ssh_host_dialog(state, None);
             true
         }
         ShortcutCommand::CloseWorkspace => {
@@ -4346,6 +4417,463 @@ fn initial_workspace_state(home_dir: Option<&Path>, current_dir: Option<&Path>) 
         .filter(|segment| !segment.is_empty())
         .unwrap_or_else(|| folder_path.clone());
     workspace_state_with_folder(&name, &folder_path)
+}
+
+// ---------------------------------------------------------------------------
+// SSH HOSTS connection manager
+// ---------------------------------------------------------------------------
+
+/// Rebuild every row in the SSH sidebar section from `state.ssh_hosts`. Rows map
+/// to `ssh_hosts` by index, so this must run after any mutation of that vector.
+fn refresh_ssh_hosts(state: &State) {
+    let (ssh_list, hosts) = {
+        let s = state.borrow();
+        (s.ssh_list.clone(), s.ssh_hosts.clone())
+    };
+    while let Some(child) = ssh_list.first_child() {
+        ssh_list.remove(&child);
+    }
+    for (idx, host) in hosts.iter().enumerate() {
+        let row = build_ssh_host_row(host);
+        ssh_list.append(&row);
+        install_ssh_row_interactions(state, idx, &row);
+    }
+}
+
+/// `user@host[:port]` subtitle for an SSH row (pure; no GTK).
+fn ssh_host_subtitle(host: &crate::ssh_hosts::SshHost) -> String {
+    let mut subtitle = String::new();
+    if let Some(user) = host
+        .user
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    {
+        subtitle.push_str(user);
+        subtitle.push('@');
+    }
+    subtitle.push_str(&host.host_name);
+    if let Some(port) = host.port {
+        subtitle.push(':');
+        subtitle.push_str(&port.to_string());
+    }
+    subtitle
+}
+
+/// A sidebar row for one SSH host: alias on top, `user@host[:port]` beneath.
+/// Mirrors `build_sidebar_row`'s box/label CSS.
+fn build_ssh_host_row(host: &crate::ssh_hosts::SshHost) -> gtk::ListBoxRow {
+    let name_label = gtk::Label::builder()
+        .label(&host.alias)
+        .xalign(0.0)
+        .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .build();
+    name_label.add_css_class("limux-ws-name");
+
+    let subtitle_label = gtk::Label::builder()
+        .label(ssh_host_subtitle(host))
+        .xalign(0.0)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .margin_start(8)
+        .build();
+    subtitle_label.add_css_class("limux-ws-path");
+
+    let vbox = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .build();
+    vbox.add_css_class("limux-sidebar-row-box");
+    vbox.append(&name_label);
+    vbox.append(&subtitle_label);
+
+    let row = gtk::ListBoxRow::new();
+    row.set_child(Some(&vbox));
+    if host.from_ssh_config {
+        row.set_tooltip_text(Some("Discovered in ~/.ssh/config"));
+    }
+    row
+}
+
+/// Right-click (button 3) on an SSH row → Edit / Delete popover.
+fn install_ssh_row_interactions(state: &State, idx: usize, row: &gtk::ListBoxRow) {
+    let right_click = gtk::GestureClick::new();
+    right_click.set_button(3);
+    let state = state.clone();
+    let r = row.clone();
+    right_click.connect_pressed(move |_, _, _, _| {
+        show_ssh_host_context_menu(&state, idx, &r);
+    });
+    row.add_controller(right_click);
+}
+
+fn show_ssh_host_context_menu(state: &State, idx: usize, row: &gtk::ListBoxRow) {
+    let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    menu_box.set_margin_top(4);
+    menu_box.set_margin_bottom(4);
+    menu_box.set_margin_start(4);
+    menu_box.set_margin_end(4);
+
+    let edit_btn = gtk::Button::with_label("Edit");
+    edit_btn.add_css_class("flat");
+    let delete_btn = gtk::Button::with_label("Delete");
+    delete_btn.add_css_class("flat");
+    delete_btn.add_css_class("destructive-action");
+
+    menu_box.append(&edit_btn);
+    menu_box.append(&delete_btn);
+
+    let popover = gtk::Popover::new();
+    popover.set_child(Some(&menu_box));
+    popover.set_parent(row);
+    popover.set_position(gtk::PositionType::Right);
+
+    {
+        let state = state.clone();
+        let pop = popover.clone();
+        edit_btn.connect_clicked(move |_| {
+            pop.popdown();
+            show_ssh_host_dialog(&state, Some(idx));
+        });
+    }
+    {
+        let state = state.clone();
+        let pop = popover.clone();
+        delete_btn.connect_clicked(move |_| {
+            pop.popdown();
+            delete_ssh_host(&state, idx);
+        });
+    }
+    popover.connect_closed(move |p| {
+        p.unparent();
+    });
+
+    popover.popup();
+}
+
+/// Remove the host at `idx`, persist the saved set, and rebuild the rows.
+/// Deleting a `from_ssh_config` host only drops it from the current view
+/// (`save_hosts` never wrote it); it reappears on the next launch.
+fn delete_ssh_host(state: &State, idx: usize) {
+    let hosts = {
+        let mut s = state.borrow_mut();
+        if idx >= s.ssh_hosts.len() {
+            return;
+        }
+        s.ssh_hosts.remove(idx);
+        s.ssh_hosts.clone()
+    };
+    if let Err(err) = crate::ssh_hosts::save_hosts(&hosts) {
+        eprintln!("limux: failed to save SSH hosts: {err}");
+    }
+    refresh_ssh_hosts(state);
+}
+
+/// Open a new workspace whose single pane execs the host's ssh command.
+fn connect_ssh_host(state: &State, host: &crate::ssh_hosts::SshHost) {
+    let workspace = WorkspaceState {
+        id: None,
+        name: host.alias.clone(),
+        favorite: false,
+        cwd: None,
+        folder_path: None,
+        autostart_command: None,
+        layout: LayoutNodeState::Pane(PaneState::ssh(None, host.to_connection())),
+    };
+    add_workspace_from_state(state, &workspace);
+    request_session_save(state);
+}
+
+/// Raw SSH-dialog field values, grouped so the parser stays one pure function
+/// without tripping clippy's argument-count lint.
+struct SshHostForm<'a> {
+    alias: &'a str,
+    host_name: &'a str,
+    user: &'a str,
+    port: &'a str,
+    identity_file: &'a str,
+    proxy_jump: &'a str,
+    persist_tmux: bool,
+    auto_reconnect: bool,
+}
+
+/// Build an `SshHost` from raw dialog field text (pure; no GTK). Validates that
+/// alias and host are non-empty and that a non-empty port parses as a `u16`.
+fn parse_ssh_host_form(form: SshHostForm<'_>) -> Result<crate::ssh_hosts::SshHost, String> {
+    let alias = form.alias.trim();
+    if alias.is_empty() {
+        return Err("Alias is required".to_string());
+    }
+    let host_name = form.host_name.trim();
+    if host_name.is_empty() {
+        return Err("HostName is required".to_string());
+    }
+    let port = {
+        let port = form.port.trim();
+        if port.is_empty() {
+            None
+        } else {
+            Some(port.parse::<u16>().map_err(|_| {
+                format!("Port must be a number between 1 and 65535 (got \"{port}\")")
+            })?)
+        }
+    };
+    let optional = |value: &str| {
+        let value = value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value.to_string())
+        }
+    };
+    Ok(crate::ssh_hosts::SshHost {
+        alias: alias.to_string(),
+        host_name: host_name.to_string(),
+        user: optional(form.user),
+        port,
+        identity_file: optional(form.identity_file),
+        proxy_jump: optional(form.proxy_jump),
+        persist_tmux: form.persist_tmux,
+        auto_reconnect: form.auto_reconnect,
+        from_ssh_config: false,
+    })
+}
+
+/// A `Label: <field>` row for the SSH dialog form.
+fn ssh_form_row(label_text: &str, field: &impl IsA<gtk::Widget>) -> gtk::Box {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    let label = gtk::Label::builder()
+        .label(label_text)
+        .xalign(0.0)
+        .width_request(96)
+        .build();
+    label.set_halign(gtk::Align::Start);
+    row.append(&label);
+    row.append(field);
+    row
+}
+
+/// Add (existing = None) or edit (existing = Some(index)) an SSH host.
+fn show_ssh_host_dialog(state: &State, existing: Option<usize>) {
+    let existing_host = existing.and_then(|idx| state.borrow().ssh_hosts.get(idx).cloned());
+
+    let dialog = gtk::Window::builder()
+        .title(if existing.is_some() {
+            "Edit SSH Host"
+        } else {
+            "Add SSH Host"
+        })
+        .modal(true)
+        .default_width(480)
+        .build();
+    if let Some(window) = active_window(state) {
+        dialog.set_transient_for(Some(&window));
+    }
+
+    let alias_entry = gtk::Entry::builder().hexpand(true).build();
+    let host_entry = gtk::Entry::builder().hexpand(true).build();
+    let user_entry = gtk::Entry::builder().hexpand(true).build();
+    let port_entry = gtk::Entry::builder().hexpand(true).build();
+    let identity_entry = gtk::Entry::builder().hexpand(true).build();
+    let proxy_entry = gtk::Entry::builder().hexpand(true).build();
+    let browse_button = gtk::Button::with_label("Browse...");
+    let persist_check = gtk::CheckButton::with_label("Keep session alive with remote tmux");
+    let reconnect_check = gtk::CheckButton::with_label("Auto-reconnect on drop");
+    persist_check.set_active(true);
+    reconnect_check.set_active(true);
+
+    if let Some(host) = existing_host.as_ref() {
+        alias_entry.set_text(&host.alias);
+        host_entry.set_text(&host.host_name);
+        if let Some(user) = host.user.as_deref() {
+            user_entry.set_text(user);
+        }
+        if let Some(port) = host.port {
+            port_entry.set_text(&port.to_string());
+        }
+        if let Some(identity) = host.identity_file.as_deref() {
+            identity_entry.set_text(identity);
+        }
+        if let Some(proxy) = host.proxy_jump.as_deref() {
+            proxy_entry.set_text(proxy);
+        }
+        persist_check.set_active(host.persist_tmux);
+        reconnect_check.set_active(host.auto_reconnect);
+    }
+
+    let error_label = gtk::Label::builder()
+        .halign(gtk::Align::Start)
+        .visible(false)
+        .wrap(true)
+        .build();
+    error_label.add_css_class("error");
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+
+    content.append(&ssh_form_row("Alias", &alias_entry));
+    content.append(&ssh_form_row("HostName", &host_entry));
+    content.append(&ssh_form_row("User", &user_entry));
+    content.append(&ssh_form_row("Port", &port_entry));
+
+    let identity_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+    let identity_label = gtk::Label::builder()
+        .label("IdentityFile")
+        .xalign(0.0)
+        .width_request(96)
+        .build();
+    identity_label.set_halign(gtk::Align::Start);
+    identity_row.append(&identity_label);
+    identity_row.append(&identity_entry);
+    identity_row.append(&browse_button);
+    content.append(&identity_row);
+
+    content.append(&ssh_form_row("ProxyJump", &proxy_entry));
+    content.append(&persist_check);
+    content.append(&reconnect_check);
+    content.append(&error_label);
+
+    let buttons = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .halign(gtk::Align::End)
+        .spacing(8)
+        .build();
+    let cancel_button = gtk::Button::with_label("Cancel");
+    let save_button = gtk::Button::with_label("Save");
+    save_button.add_css_class("suggested-action");
+    buttons.append(&cancel_button);
+    buttons.append(&save_button);
+    content.append(&buttons);
+    dialog.set_child(Some(&content));
+
+    alias_entry.grab_focus();
+
+    // Browse for an identity file.
+    {
+        let identity_entry = identity_entry.clone();
+        let browse_button_outer = browse_button.clone();
+        let transient = active_window(state);
+        browse_button.connect_clicked(move |_| {
+            browse_button_outer.set_sensitive(false);
+            let picker = gtk::FileDialog::builder()
+                .title("Choose Identity File")
+                .accept_label("Choose")
+                .modal(true)
+                .build();
+            let current = identity_entry.text();
+            let trimmed = current.trim();
+            if !trimmed.is_empty() {
+                picker.set_initial_file(Some(&gio::File::for_path(trimmed)));
+            }
+            let identity_entry = identity_entry.clone();
+            let browse_button_result = browse_button_outer.clone();
+            picker.open(
+                transient.as_ref(),
+                None::<&gio::Cancellable>,
+                move |result| {
+                    browse_button_result.set_sensitive(true);
+                    if let Ok(file) = result {
+                        if let Some(path) = file.path() {
+                            identity_entry.set_text(&path.to_string_lossy());
+                            identity_entry.set_position(-1);
+                        }
+                    }
+                },
+            );
+        });
+    }
+
+    // Save.
+    {
+        let state = state.clone();
+        let dialog = dialog.clone();
+        let alias_entry = alias_entry.clone();
+        let host_entry = host_entry.clone();
+        let user_entry = user_entry.clone();
+        let port_entry = port_entry.clone();
+        let identity_entry = identity_entry.clone();
+        let proxy_entry = proxy_entry.clone();
+        let persist_check = persist_check.clone();
+        let reconnect_check = reconnect_check.clone();
+        let error_label = error_label.clone();
+        save_button.connect_clicked(move |_| {
+            // Bind the GString values so the borrowed &str form fields outlive the call.
+            let alias = alias_entry.text();
+            let host_name = host_entry.text();
+            let user = user_entry.text();
+            let port = port_entry.text();
+            let identity_file = identity_entry.text();
+            let proxy_jump = proxy_entry.text();
+            match parse_ssh_host_form(SshHostForm {
+                alias: alias.as_str(),
+                host_name: host_name.as_str(),
+                user: user.as_str(),
+                port: port.as_str(),
+                identity_file: identity_file.as_str(),
+                proxy_jump: proxy_jump.as_str(),
+                persist_tmux: persist_check.is_active(),
+                auto_reconnect: reconnect_check.is_active(),
+            }) {
+                Ok(host) => {
+                    let hosts = {
+                        let mut s = state.borrow_mut();
+                        match existing {
+                            Some(idx) if idx < s.ssh_hosts.len() => s.ssh_hosts[idx] = host,
+                            _ => s.ssh_hosts.push(host),
+                        }
+                        s.ssh_hosts.clone()
+                    };
+                    if let Err(err) = crate::ssh_hosts::save_hosts(&hosts) {
+                        error_label.set_label(&format!("Could not save hosts: {err}"));
+                        error_label.set_visible(true);
+                        return;
+                    }
+                    refresh_ssh_hosts(&state);
+                    dialog.close();
+                }
+                Err(message) => {
+                    error_label.set_label(&message);
+                    error_label.set_visible(true);
+                }
+            }
+        });
+    }
+
+    // Enter in any text field triggers Save.
+    for entry in [
+        &alias_entry,
+        &host_entry,
+        &user_entry,
+        &port_entry,
+        &identity_entry,
+        &proxy_entry,
+    ] {
+        let save_button = save_button.clone();
+        entry.connect_activate(move |_| {
+            save_button.emit_clicked();
+        });
+    }
+
+    {
+        let dialog = dialog.clone();
+        cancel_button.connect_clicked(move |_| {
+            dialog.close();
+        });
+    }
+
+    dialog.present();
 }
 
 fn dispatch_control_command(command: ControlCommand) {
@@ -6623,23 +7151,77 @@ mod tests {
         directional_neighbor_score, favorites_prefix_len, find_leaf_pane, font_size_after_delta,
         ghostty_prefers_dark, gtk_system_prefers_dark_from_raw, has_unread,
         initial_workspace_state, keep_workspace_open_after_empty_pane, next_active_workspace_index,
-        normalize_autostart_command, pane_create_split_placement, queue_session_save_request,
-        resolve_pane_create_source_id, resolved_system_prefers_dark, sanitize_background_opacity,
-        shortcut_allowed_while_browser_find_active, shortcut_blocked_by_editable,
-        shortcut_command_from_key_event, shortcut_dispatch_propagation,
-        should_emit_desktop_notification, tab_drag_workspace_seed, use_opaque_window_background,
+        normalize_autostart_command, pane_create_split_placement, parse_ssh_host_form,
+        queue_session_save_request, resolve_pane_create_source_id, resolved_system_prefers_dark,
+        sanitize_background_opacity, shortcut_allowed_while_browser_find_active,
+        shortcut_blocked_by_editable, shortcut_command_from_key_event,
+        shortcut_dispatch_propagation, should_emit_desktop_notification, ssh_host_subtitle,
+        tab_drag_workspace_seed, use_opaque_window_background,
         validate_workspace_folder_input_with_dirs, workspace_autostart_dialog_dismisses,
         workspace_drop_layout_path, workspace_folder_path_from_input,
         workspace_notification_message, workspace_path_visible, Direction, EditableCaptureContext,
         NeighborScore, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
-        PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, WorkspaceSeedSource,
-        BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
+        PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, SshHostForm,
+        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
         WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::layout_state::{LayoutNodeState, PaneState, SplitOrientation, SplitState};
     use crate::shortcut_config::{
         default_shortcuts, resolve_shortcuts_from_str, EditableCapturePolicy, ShortcutCommand,
     };
+
+    #[test]
+    fn parse_ssh_host_form_builds_saved_host_and_trims() {
+        let host = parse_ssh_host_form(SshHostForm {
+            alias: "  dev  ",
+            host_name: " 10.0.0.5 ",
+            user: " alice ",
+            port: " 2222 ",
+            identity_file: "  ",
+            proxy_jump: "bastion",
+            persist_tmux: true,
+            auto_reconnect: false,
+        })
+        .expect("valid form");
+        assert_eq!(host.alias, "dev");
+        assert_eq!(host.host_name, "10.0.0.5");
+        assert_eq!(host.user.as_deref(), Some("alice"));
+        assert_eq!(host.port, Some(2222));
+        assert_eq!(host.identity_file, None);
+        assert_eq!(host.proxy_jump.as_deref(), Some("bastion"));
+        assert!(host.persist_tmux);
+        assert!(!host.auto_reconnect);
+        assert!(!host.from_ssh_config);
+    }
+
+    #[test]
+    fn parse_ssh_host_form_rejects_empty_and_bad_port() {
+        let form = |alias, host_name, port| SshHostForm {
+            alias,
+            host_name,
+            user: "",
+            port,
+            identity_file: "",
+            proxy_jump: "",
+            persist_tmux: true,
+            auto_reconnect: true,
+        };
+        assert!(parse_ssh_host_form(form("", "h", "")).is_err());
+        assert!(parse_ssh_host_form(form("a", "", "")).is_err());
+        assert!(parse_ssh_host_form(form("a", "h", "notaport")).is_err());
+        assert!(parse_ssh_host_form(form("a", "h", "70000")).is_err());
+        assert!(parse_ssh_host_form(form("a", "h", "")).is_ok());
+    }
+
+    #[test]
+    fn ssh_host_subtitle_formats_user_host_port() {
+        let mut host = crate::ssh_hosts::SshHost::new("dev", "10.0.0.5");
+        assert_eq!(ssh_host_subtitle(&host), "10.0.0.5");
+        host.user = Some("alice".to_string());
+        host.port = Some(2222);
+        assert_eq!(ssh_host_subtitle(&host), "alice@10.0.0.5:2222");
+    }
+
     #[derive(Default)]
     struct TestSessionSaveState {
         persistence_suspended: bool,

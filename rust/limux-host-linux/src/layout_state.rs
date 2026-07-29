@@ -186,6 +186,105 @@ impl RestorableAgentState {
     }
 }
 
+/// A saved SSH target for a terminal tab. Persisted inside
+/// `TabContentState::Terminal` so an SSH pane re-establishes itself on session
+/// restore, and so auto-reconnect knows exactly what to re-run after a drop.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+pub struct SshConnection {
+    pub host: String,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub identity_file: Option<String>,
+    #[serde(default)]
+    pub proxy_jump: Option<String>,
+    #[serde(default)]
+    pub remote_session_name: Option<String>,
+    #[serde(default = "default_true")]
+    pub persist_tmux: bool,
+    #[serde(default = "default_true")]
+    pub auto_reconnect: bool,
+}
+
+impl SshConnection {
+    /// A tmux session name derived from the connection, sanitized to the
+    /// characters tmux allows (it forbids '.' and ':').
+    pub fn tmux_session_name(&self) -> String {
+        let base = self
+            .remote_session_name
+            .as_deref()
+            .map(str::to_string)
+            .unwrap_or_else(|| self.host.clone());
+        let sanitized: String = base
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if sanitized.is_empty() {
+            "limux".to_string()
+        } else {
+            sanitized
+        }
+    }
+
+    /// The shell-interpreted command a pane execs to (re)establish this
+    /// connection. When `persist_tmux` is set the remote side attaches to (or
+    /// creates) a tmux session so work survives a dropped connection or a
+    /// remote reboot; the ServerAlive options make a dead link surface quickly
+    /// so auto-reconnect can kick in.
+    pub fn reconnect_command(&self) -> String {
+        let mut parts: Vec<String> = vec!["ssh".to_string()];
+        if let Some(port) = self.port {
+            parts.push("-p".to_string());
+            parts.push(port.to_string());
+        }
+        if let Some(identity) = self.identity_file.as_deref().and_then(normalized_str) {
+            parts.push("-i".to_string());
+            parts.push(identity);
+        }
+        if let Some(proxy) = self.proxy_jump.as_deref().and_then(normalized_str) {
+            parts.push("-J".to_string());
+            parts.push(proxy);
+        }
+        parts.push("-o".to_string());
+        parts.push("ServerAliveInterval=15".to_string());
+        parts.push("-o".to_string());
+        parts.push("ServerAliveCountMax=3".to_string());
+        if self.persist_tmux {
+            // Force a PTY so tmux runs interactively.
+            parts.push("-t".to_string());
+        }
+        let target = match self.user.as_deref().and_then(normalized_str) {
+            Some(user) => format!("{user}@{}", self.host),
+            None => self.host.clone(),
+        };
+        parts.push(target);
+
+        let mut command = parts
+            .iter()
+            .map(|part| shell_single_quote(part))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        if self.persist_tmux {
+            let session = self.tmux_session_name();
+            // `session` is sanitized to [A-Za-z0-9_-], so it needs no further
+            // remote-side quoting; the whole remote command is passed as one arg.
+            let remote = format!("tmux new -A -s {session}");
+            command.push(' ');
+            command.push_str(&shell_single_quote(&remote));
+        }
+        command
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "tab_kind", rename_all = "snake_case")]
 pub enum TabContentState {
@@ -194,6 +293,9 @@ pub enum TabContentState {
         cwd: Option<String>,
         #[serde(default)]
         agent: Option<RestorableAgentState>,
+        // Boxed: only SSH tabs set this, so keep the common Terminal variant small.
+        #[serde(default)]
+        ssh: Option<Box<SshConnection>>,
     },
     Browser {
         #[serde(default)]
@@ -252,6 +354,15 @@ impl PaneState {
             tabs: vec![tab],
         }
     }
+
+    pub fn ssh(working_directory: Option<&str>, ssh: SshConnection) -> Self {
+        let tab = TabState::terminal_ssh(default_tab_id("terminal"), working_directory, ssh);
+        Self {
+            pane_id: None,
+            active_tab_id: Some(tab.id.clone()),
+            tabs: vec![tab],
+        }
+    }
 }
 
 impl TabState {
@@ -263,6 +374,20 @@ impl TabState {
             content: TabContentState::Terminal {
                 cwd: cwd.map(|value| value.to_string()),
                 agent: None,
+                ssh: None,
+            },
+        }
+    }
+
+    pub fn terminal_ssh(id: impl Into<String>, cwd: Option<&str>, ssh: SshConnection) -> Self {
+        Self {
+            id: id.into(),
+            custom_name: None,
+            pinned: false,
+            content: TabContentState::Terminal {
+                cwd: cwd.map(|value| value.to_string()),
+                agent: None,
+                ssh: Some(Box::new(ssh)),
             },
         }
     }
@@ -694,6 +819,10 @@ fn default_split_ratio() -> f64 {
 
 fn default_tab_id(prefix: &str) -> String {
     format!("{prefix}-0")
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn build_resume_command(
@@ -1414,6 +1543,7 @@ mod tests {
                 pinned: false,
                 content: TabContentState::Terminal {
                     cwd: Some("/tmp/project".to_string()),
+                    ssh: None,
                     agent: Some(RestorableAgentState {
                         kind: RestorableAgentKind::Codex,
                         session_id: "persisted-session".to_string(),
@@ -1499,6 +1629,7 @@ mod tests {
             pinned: false,
             content: TabContentState::Terminal {
                 cwd: Some("/tmp/project".to_string()),
+                ssh: None,
                 agent: Some(RestorableAgentState {
                     kind: RestorableAgentKind::Codex,
                     session_id: "sess-123".to_string(),

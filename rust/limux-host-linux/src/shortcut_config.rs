@@ -63,6 +63,7 @@ pub enum ShortcutId {
     TerminalIncreaseFontSize,
     TerminalDecreaseFontSize,
     TerminalResetFontSize,
+    OpenSshManager,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -115,6 +116,7 @@ pub enum ShortcutCommand {
     TerminalIncreaseFontSize,
     TerminalDecreaseFontSize,
     TerminalResetFontSize,
+    OpenSshManager,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -313,7 +315,7 @@ struct ShortcutConfigFile {
     shortcuts: HashMap<String, serde_json::Value>,
 }
 
-const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 49] = [
+const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 50] = [
     ShortcutDefinition {
         id: ShortcutId::NewWorkspace,
         config_key: "new_workspace",
@@ -851,6 +853,17 @@ const SHORTCUT_DEFINITIONS: [ShortcutDefinition; 49] = [
         registers_gtk_accel: false,
         command: ShortcutCommand::TerminalResetFontSize,
         scope: ShortcutScope::FocusedTerminal,
+        editable_capture_policy: EditableCapturePolicy::BypassInEditable,
+    },
+    ShortcutDefinition {
+        id: ShortcutId::OpenSshManager,
+        config_key: "open_ssh_manager",
+        action_name: "win.open-ssh-manager",
+        default_accel: "<Ctrl><Alt><Shift>s",
+        label: "New SSH Connection\u{2026}",
+        registers_gtk_accel: false,
+        command: ShortcutCommand::OpenSshManager,
+        scope: ShortcutScope::Window,
         editable_capture_policy: EditableCapturePolicy::BypassInEditable,
     },
 ];
@@ -1715,7 +1728,7 @@ mod tests {
 
     #[test]
     fn definitions_cover_current_host_shortcuts() {
-        assert_eq!(definitions().len(), 49);
+        assert_eq!(definitions().len(), 50);
     }
 
     #[test]
