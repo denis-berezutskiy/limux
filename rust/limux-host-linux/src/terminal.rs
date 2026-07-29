@@ -51,6 +51,11 @@ type DesktopNotificationCallback = dyn Fn(&str, &str, bool);
 type BellCallback = dyn Fn(bool);
 type OpenUrlCallback = dyn Fn(&str, LinkOpenRequest);
 type VoidCallback = dyn Fn();
+/// Fired when a surface's child process exits. Carries the exit code when it is
+/// known (`Some` from the `SHOW_CHILD_EXITED` action payload) and `None` from
+/// the code-less runtime `close_surface_cb` path. Auto-reconnect uses the code
+/// to distinguish a dropped connection (non-zero) from a clean exit (zero).
+type CloseCallback = dyn Fn(Option<i32>);
 type WidgetCallback = dyn Fn(&gtk::Widget);
 type IdentityCallback = dyn Fn() -> TerminalIdentity;
 
@@ -85,7 +90,7 @@ struct SurfaceEntry {
     on_desktop_notification: Option<Box<DesktopNotificationCallback>>,
     on_bell: Option<Box<BellCallback>>,
     on_open_url: Option<Rc<OpenUrlCallback>>,
-    on_close: Option<Box<VoidCallback>>,
+    on_close: Option<Box<CloseCallback>>,
     clipboard_context: *mut ClipboardContext,
     // Hover URL preview for OSC 8 hyperlinks. The popover is a child of
     // `gl_area` so it inherits libadwaita's popover styling — matching the
@@ -1131,11 +1136,16 @@ unsafe extern "C" fn ghostty_action_cb(
         GHOSTTY_ACTION_SHOW_CHILD_EXITED => {
             if target.tag == GHOSTTY_TARGET_SURFACE {
                 let surface_key = unsafe { target.target.surface } as usize;
+                // This path carries the real exit code. Ghostty emits it before
+                // it (optionally) closes the surface, so it always reaches
+                // `on_close` ahead of the code-less `close_surface_cb` and is the
+                // authoritative signal for the auto-reconnect decision.
+                let exit_code = unsafe { action.action.child_exited.exit_code } as i32;
                 glib::idle_add_local_once(move || {
                     SURFACE_MAP.with(|map| {
                         if let Some(entry) = map.borrow().get(&surface_key) {
                             if let Some(cb) = &entry.on_close {
-                                cb();
+                                cb(Some(exit_code));
                             }
                         }
                     });
@@ -1283,7 +1293,8 @@ unsafe extern "C" fn ghostty_close_surface_cb(userdata: *mut c_void, _process_al
         SURFACE_MAP.with(|map| {
             if let Some(entry) = map.borrow().get(&surface_key) {
                 if let Some(cb) = &entry.on_close {
-                    cb();
+                    // No exit code is available on the runtime close path.
+                    cb(None);
                 }
             }
         });
@@ -1299,7 +1310,7 @@ pub struct TerminalCallbacks {
     pub on_pwd_changed: Box<PwdChangedCallback>,
     pub on_desktop_notification: Box<DesktopNotificationCallback>,
     pub on_bell: Box<BellCallback>,
-    pub on_close: Box<VoidCallback>,
+    pub on_close: Box<CloseCallback>,
     pub on_open_url: Box<OpenUrlCallback>,
     pub on_open_browser_here: Box<VoidCallback>,
     pub on_split_right: Box<VoidCallback>,
@@ -1315,7 +1326,7 @@ impl TerminalCallbacks {
             on_pwd_changed: Box::new(|_| {}),
             on_desktop_notification: Box::new(|_, _, _| {}),
             on_bell: Box::new(|_| {}),
-            on_close: Box::new(|| {}),
+            on_close: Box::new(|_| {}),
             on_open_url: Box::new(|_, _| {}),
             on_open_browser_here: Box::new(|| {}),
             on_split_right: Box::new(|| {}),
@@ -1749,9 +1760,9 @@ pub fn create_terminal(
                         })),
                         on_close: Some(Box::new({
                             let cb = callbacks.clone();
-                            move || {
+                            move |exit_code| {
                                 let callbacks = cb.borrow();
-                                (callbacks.on_close)();
+                                (callbacks.on_close)(exit_code);
                             }
                         })),
                         clipboard_context,

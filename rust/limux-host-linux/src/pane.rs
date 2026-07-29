@@ -11,6 +11,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use gtk::glib;
 #[allow(unused_imports)]
@@ -269,6 +270,80 @@ struct TerminalTabState {
     /// Present when this tab is an SSH session; drives snapshot persistence
     /// and auto-reconnect on child exit.
     ssh: Option<SshConnection>,
+    /// Runtime-only auto-reconnect bookkeeping (never serialized). Preserved
+    /// across respawns so the storm guard can count consecutive fast failures.
+    reconnect: ReconnectBookkeeping,
+}
+
+/// Per-tab auto-reconnect bookkeeping. Tracks how many times in a row the SSH
+/// child has died quickly and when the current session was (re)spawned, so the
+/// storm guard can back off instead of relaunching a permanently-broken target
+/// forever.
+#[derive(Clone, Copy, Debug, Default)]
+struct ReconnectBookkeeping {
+    fast_fail_count: u32,
+    last_spawn: Option<Instant>,
+}
+
+/// A reconnected SSH session must survive at least this long before we treat
+/// the reconnect as a success and reset the fast-failure counter.
+const FAST_FAIL_WINDOW: Duration = Duration::from_secs(3);
+
+/// Consecutive fast failures allowed before auto-reconnect gives up. Stops a
+/// permanently-broken target (dead host, auth failure) from looping forever.
+const RECONNECT_FAST_FAIL_CAP: u32 = 5;
+
+/// What to do when a terminal's child process exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitAction {
+    /// Remove the tab: a normal shell exit, a clean SSH exit, or any pane that
+    /// is not an auto-reconnect SSH pane.
+    Remove,
+    /// Respawn the SSH connection command into the same tab slot.
+    Reconnect,
+    /// Too many consecutive fast failures — stop reconnecting and remove.
+    GiveUp,
+}
+
+/// Update the consecutive fast-failure counter given how long the session that
+/// just exited actually lasted. A session that survived at least
+/// [`FAST_FAIL_WINDOW`] (or whose spawn time is unknown) resets the counter; a
+/// shorter-lived one increments it.
+fn next_fast_fail_count(prev: u32, session_duration: Option<Duration>) -> u32 {
+    match session_duration {
+        Some(d) if d < FAST_FAIL_WINDOW => prev.saturating_add(1),
+        _ => 0,
+    }
+}
+
+/// Decide what to do when a terminal child exits.
+///
+/// * `exit_code` — `Some(code)` from the `SHOW_CHILD_EXITED` payload, or `None`
+///   from the code-less `close_surface_cb` path.
+/// * `auto_reconnect` — this is an SSH pane whose `auto_reconnect` flag is set.
+/// * `fast_fail_count` — consecutive fast failures, already updated for this
+///   exit (see [`next_fast_fail_count`]).
+///
+/// Only a confirmed non-zero exit on an auto-reconnect SSH pane reconnects. A
+/// clean exit (code 0), a code-less close (`None`), or any non-reconnect pane
+/// is removed. Once the fast-failure count passes [`RECONNECT_FAST_FAIL_CAP`]
+/// we give up (which also removes the tab).
+fn decide_exit_action(
+    exit_code: Option<i32>,
+    auto_reconnect: bool,
+    fast_fail_count: u32,
+) -> ExitAction {
+    if !auto_reconnect {
+        return ExitAction::Remove;
+    }
+    let dropped = matches!(exit_code, Some(code) if code != 0);
+    if !dropped {
+        return ExitAction::Remove;
+    }
+    if fast_fail_count > RECONNECT_FAST_FAIL_CAP {
+        return ExitAction::GiveUp;
+    }
+    ExitAction::Reconnect
 }
 
 #[derive(Clone)]
@@ -1203,17 +1278,12 @@ fn make_terminal_callbacks(
     let state_for_title = internals.tab_state.clone();
     let callbacks_for_bell = internals.callbacks.clone();
     let callbacks_for_pwd = internals.callbacks.clone();
-    let callbacks_for_close = internals.callbacks.clone();
     let callbacks_for_browser_here = internals.callbacks.clone();
     let callbacks_for_open_url = internals.callbacks.clone();
     let callbacks_for_split_right = internals.callbacks.clone();
     let callbacks_for_split_down = internals.callbacks.clone();
     let callbacks_for_keybinds = internals.callbacks.clone();
     let callbacks_for_identity = internals.callbacks.clone();
-    let tab_strip = internals.tab_strip.clone();
-    let content_stack = internals.content_stack.clone();
-    let tab_state = internals.tab_state.clone();
-    let pane_outer = internals.pane_outer.clone();
     let term_cwd_for_pwd = term_cwd.clone();
     let tid_for_close = tab_id.to_string();
     let tid_for_notification = tab_id.to_string();
@@ -1250,24 +1320,23 @@ fn make_terminal_callbacks(
                 (callbacks_for_bell.on_bell)(source_focused, pane_id, &tab_id);
             }
         }),
-        on_close: Box::new(move || {
-            let tab_strip = tab_strip.clone();
-            let content_stack = content_stack.clone();
-            let tab_state = tab_state.clone();
-            let callbacks = callbacks_for_close.clone();
-            let pane_outer = pane_outer.clone();
-            let tab_id = tid_for_close.clone();
-            glib::idle_add_local_once(move || {
-                remove_tab(
-                    &tab_strip,
-                    &content_stack,
-                    &tab_state,
-                    &tab_id,
-                    &callbacks,
-                    &pane_outer,
-                    PaneEmptyReason::ClosedLastTab,
-                );
-            });
+        on_close: Box::new({
+            // Per-surface guard against the double-fire: one child exit reaches
+            // us from both `SHOW_CHILD_EXITED` and `close_surface_cb`. Each
+            // surface builds a fresh cell, so a respawn (which mints a new
+            // surface with its own guard) can still reconnect later.
+            let in_flight = Rc::new(Cell::new(false));
+            let tab_id = tid_for_close;
+            move |exit_code: Option<i32>| {
+                let tab_id = tab_id.clone();
+                let in_flight = in_flight.clone();
+                // Hop to the main loop before touching widgets/state: the fire
+                // sites call us while holding a borrow of the global surface
+                // map, and respawn/remove mutate it via widget destruction.
+                glib::idle_add_local_once(move || {
+                    handle_terminal_exit(pane_id, &tab_id, exit_code, &in_flight);
+                });
+            }
         }),
         on_open_url: Box::new({
             let pane_outer = internals.pane_outer.clone();
@@ -1406,24 +1475,50 @@ fn open_url_in_external_browser(url: &str) {
     }
 }
 
-fn add_terminal_tab_inner(
-    internals: &Rc<PaneInternals>,
-    working_directory: Option<&str>,
-    options: Option<TerminalTabOptions<'_>>,
-) {
-    let tab_id = options
-        .as_ref()
-        .and_then(|value| value.id.map(|id| id.to_string()))
-        .unwrap_or_else(next_tab_id);
-    let (tab_btn, title_label, unread_dot) = build_tab_button("Terminal", &tab_id, internals);
+/// Build the env the spawned shell will see. Encodes this terminal's identity
+/// so CLI calls (e.g. `limux identify`, `limux send`) auto-target the current
+/// surface without flags. Mirrors cmux's env auto-wiring. Shared by the
+/// initial spawn and by auto-reconnect respawns so both see the same identity.
+fn build_terminal_env(internals: &Rc<PaneInternals>, tab_id: &str) -> Vec<(String, String)> {
+    let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
+    let workspace_id_for_env = (internals.callbacks.workspace_for_pane)(&pane_widget);
+    let surface_id_for_env = format!("{}:{}", internals.pane_id, tab_id);
+    let mut extra_env: Vec<(String, String)> = Vec::new();
+    if let Some(ws) = workspace_id_for_env {
+        extra_env.push(("LIMUX_WORKSPACE_ID".to_string(), ws));
+    }
+    extra_env.push(("LIMUX_SURFACE_ID".to_string(), surface_id_for_env));
+    extra_env.push(("LIMUX_PANE_ID".to_string(), internals.pane_id.to_string()));
+    extra_env.push(("LIMUX_TAB_ID".to_string(), tab_id.to_string()));
+    extra_env.extend(crate::terminal_child_environment_overrides());
+    if let Some(sock) = limux_control::socket_path::resolve_socket_path(
+        None,
+        limux_control::socket_path::SocketMode::Runtime,
+    )
+    .to_str()
+    {
+        extra_env.push(("LIMUX_SOCKET".to_string(), sock.to_string()));
+    }
+    extra_env
+}
 
-    let term_cwd = Rc::new(RefCell::new(
-        options
-            .as_ref()
-            .and_then(|value| value.cwd.map(|cwd| cwd.to_string()))
-            .or_else(|| working_directory.map(|cwd| cwd.to_string())),
-    ));
-    let term_callbacks = make_terminal_callbacks(internals, &tab_id, &title_label, &term_cwd);
+/// Build a fresh terminal widget (callbacks + env + surface) for `tab_id`.
+///
+/// This is the reusable half of tab creation: it does not touch the tab strip,
+/// the content stack, or `TabState`, so it can serve both the initial spawn
+/// ([`add_terminal_tab_inner`]) and an in-place auto-reconnect respawn
+/// ([`respawn_terminal_tab`]). Passing `startup_command = Some(cmd)` execs that
+/// command as the child (e.g. an SSH reconnect line).
+fn build_terminal_widget(
+    internals: &Rc<PaneInternals>,
+    tab_id: &str,
+    title_label: &gtk::Label,
+    term_cwd: &Rc<RefCell<Option<String>>>,
+    working_directory: Option<&str>,
+    startup_command: Option<String>,
+    initial_input: Option<String>,
+) -> terminal::TerminalWidget {
+    let term_callbacks = make_terminal_callbacks(internals, tab_id, title_label, term_cwd);
     let hover_focus = {
         let callbacks = internals.callbacks.clone();
         let tab_state = internals.tab_state.clone();
@@ -1441,29 +1536,190 @@ fn add_terminal_tab_inner(
             copy_selection_to_clipboard
         })
     };
-
-    // Build the env the spawned shell will see. Encodes this terminal's
-    // identity so CLI calls (e.g. `limux identify`, `limux send`) auto-target
-    // the current surface without flags. Mirrors cmux's env auto-wiring.
-    let pane_widget: gtk::Widget = internals.pane_outer.clone().upcast();
-    let workspace_id_for_env = (internals.callbacks.workspace_for_pane)(&pane_widget);
-    let surface_id_for_env = format!("{}:{}", internals.pane_id, tab_id);
-    let mut extra_env: Vec<(String, String)> = Vec::new();
-    if let Some(ws) = workspace_id_for_env {
-        extra_env.push(("LIMUX_WORKSPACE_ID".to_string(), ws));
-    }
-    extra_env.push(("LIMUX_SURFACE_ID".to_string(), surface_id_for_env));
-    extra_env.push(("LIMUX_PANE_ID".to_string(), internals.pane_id.to_string()));
-    extra_env.push(("LIMUX_TAB_ID".to_string(), tab_id.clone()));
-    extra_env.extend(crate::terminal_child_environment_overrides());
-    if let Some(sock) = limux_control::socket_path::resolve_socket_path(
-        None,
-        limux_control::socket_path::SocketMode::Runtime,
+    let extra_env = build_terminal_env(internals, tab_id);
+    terminal::create_terminal(
+        working_directory,
+        terminal::TerminalOptions {
+            hover_focus,
+            copy_selection_to_clipboard,
+            saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
+            startup_command,
+            initial_input,
+            extra_env,
+        },
+        term_callbacks,
     )
-    .to_str()
-    {
-        extra_env.push(("LIMUX_SOCKET".to_string(), sock.to_string()));
+}
+
+/// Remove a terminal tab through the shared [`remove_tab`] path. Idempotent:
+/// calling it for an already-removed tab is a no-op.
+fn remove_terminal_tab(internals: &Rc<PaneInternals>, tab_id: &str) {
+    remove_tab(
+        &internals.tab_strip,
+        &internals.content_stack,
+        &internals.tab_state,
+        tab_id,
+        &internals.callbacks,
+        &internals.pane_outer,
+        PaneEmptyReason::ClosedLastTab,
+    );
+}
+
+/// Decide-and-act when a terminal child exits. Runs on the GTK main loop.
+///
+/// `in_flight` is this surface's set-once double-fire guard: `SHOW_CHILD_EXITED`
+/// (with the code) and the code-less `close_surface_cb` can both fire for one
+/// exit, and the first to run here wins. Because a respawn mints a brand-new
+/// surface with its own guard, a later drop of the reconnected session can
+/// still reconnect.
+fn handle_terminal_exit(
+    pane_id: u32,
+    tab_id: &str,
+    exit_code: Option<i32>,
+    in_flight: &Rc<Cell<bool>>,
+) {
+    if in_flight.get() {
+        return;
     }
+    let Some(internals) = lookup_pane_internals(pane_id) else {
+        return;
+    };
+    // Read this tab's SSH target and reconnect bookkeeping. The tab's state is
+    // in place by the time the child exits.
+    let (ssh, bookkeeping) = {
+        let ts = internals.tab_state.borrow();
+        let Some(entry) = ts.tabs.iter().find(|e| e.id == tab_id) else {
+            return;
+        };
+        let TabKind::Terminal { state } = &entry.kind else {
+            return;
+        };
+        (state.ssh.clone(), state.reconnect)
+    };
+    let auto_reconnect = ssh.as_ref().is_some_and(|conn| conn.auto_reconnect);
+    let now = Instant::now();
+    let session_duration = bookkeeping
+        .last_spawn
+        .map(|spawned| now.saturating_duration_since(spawned));
+    let fast_fail_count = next_fast_fail_count(bookkeeping.fast_fail_count, session_duration);
+
+    // Claim this exit before acting so a late second fire is a no-op.
+    in_flight.set(true);
+
+    match decide_exit_action(exit_code, auto_reconnect, fast_fail_count) {
+        ExitAction::Reconnect => {
+            let command = ssh
+                .as_ref()
+                .expect("Reconnect action implies an SSH connection")
+                .reconnect_command();
+            eprintln!(
+                "limux: ssh pane surface={pane_id}:{tab_id} exited (code={exit_code:?}); \
+                 auto-reconnecting (fast_fail_count={fast_fail_count})"
+            );
+            respawn_terminal_tab(
+                &internals,
+                tab_id,
+                command,
+                ReconnectBookkeeping {
+                    fast_fail_count,
+                    last_spawn: Some(now),
+                },
+            );
+        }
+        ExitAction::GiveUp => {
+            eprintln!(
+                "limux: ssh pane surface={pane_id}:{tab_id} exceeded reconnect cap \
+                 ({fast_fail_count} consecutive fast failures); giving up"
+            );
+            remove_terminal_tab(&internals, tab_id);
+        }
+        ExitAction::Remove => {
+            remove_terminal_tab(&internals, tab_id);
+        }
+    }
+}
+
+/// Rebuild the terminal surface for `tab_id` in place and re-run `command`.
+///
+/// A Ghostty child command can only be set at `ghostty_surface_new` time, so an
+/// SSH reconnect is a fresh surface swapped into the same content-stack slot.
+/// The tab's identity is preserved (id / tab_button / title_label / custom_name
+/// / pinned / ssh / cwd); only the surface `handle`, the stack `content`, and
+/// the reconnect bookkeeping change.
+fn respawn_terminal_tab(
+    internals: &Rc<PaneInternals>,
+    tab_id: &str,
+    command: String,
+    reconnect: ReconnectBookkeeping,
+) {
+    // Reuse the existing tab's title label and cwd so the new surface keeps the
+    // same identity and starts in the same local directory.
+    let (title_label, term_cwd) = {
+        let ts = internals.tab_state.borrow();
+        let Some(entry) = ts.tabs.iter().find(|e| e.id == tab_id) else {
+            return;
+        };
+        let TabKind::Terminal { state } = &entry.kind else {
+            return;
+        };
+        (entry.title_label.clone(), state.cwd.clone())
+    };
+    let working_directory = term_cwd.borrow().clone();
+
+    let term = build_terminal_widget(
+        internals,
+        tab_id,
+        &title_label,
+        &term_cwd,
+        working_directory.as_deref(),
+        Some(command),
+        None,
+    );
+    let new_widget = term.root.clone();
+
+    {
+        let mut ts = internals.tab_state.borrow_mut();
+        let Some(entry) = ts.tabs.iter_mut().find(|e| e.id == tab_id) else {
+            return;
+        };
+        // Swap the stack child under the same name. Removing the old widget
+        // destroys the old surface (freeing its pty); the new one takes its
+        // place so tab bookkeeping stays valid.
+        internals.content_stack.remove(&entry.content);
+        internals.content_stack.add_named(&new_widget, Some(tab_id));
+        entry.content = new_widget;
+        if let TabKind::Terminal { state } = &mut entry.kind {
+            state.handle = term.handle.clone();
+            state.reconnect = reconnect;
+        }
+    }
+
+    activate_tab(
+        &internals.tab_strip,
+        &internals.content_stack,
+        &internals.tab_state,
+        tab_id,
+    );
+    term.handle.focus_surface();
+}
+
+fn add_terminal_tab_inner(
+    internals: &Rc<PaneInternals>,
+    working_directory: Option<&str>,
+    options: Option<TerminalTabOptions<'_>>,
+) {
+    let tab_id = options
+        .as_ref()
+        .and_then(|value| value.id.map(|id| id.to_string()))
+        .unwrap_or_else(next_tab_id);
+    let (tab_btn, title_label, unread_dot) = build_tab_button("Terminal", &tab_id, internals);
+
+    let term_cwd = Rc::new(RefCell::new(
+        options
+            .as_ref()
+            .and_then(|value| value.cwd.map(|cwd| cwd.to_string()))
+            .or_else(|| working_directory.map(|cwd| cwd.to_string())),
+    ));
     // An SSH connection takes precedence over an agent: a tab is one or the
     // other, and if both were somehow present the remote session (which may
     // itself host the agent) is what we want to re-establish. Either way this
@@ -1512,17 +1768,14 @@ fn add_terminal_tab_inner(
         }
     }
 
-    let term = terminal::create_terminal(
+    let term = build_terminal_widget(
+        internals,
+        &tab_id,
+        &title_label,
+        &term_cwd,
         working_directory,
-        terminal::TerminalOptions {
-            hover_focus,
-            copy_selection_to_clipboard,
-            saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
-            startup_command,
-            initial_input,
-            extra_env,
-        },
-        term_callbacks,
+        startup_command,
+        initial_input,
     );
     let widget = term.root.clone();
     internals.content_stack.add_named(&widget, Some(&tab_id));
@@ -1545,6 +1798,12 @@ fn add_terminal_tab_inner(
                     cwd: term_cwd.clone(),
                     handle: term.handle.clone(),
                     ssh: ssh_connection.clone(),
+                    // Record the spawn time so the first drop can measure how
+                    // long the original session survived.
+                    reconnect: ReconnectBookkeeping {
+                        fast_fail_count: 0,
+                        last_spawn: Some(Instant::now()),
+                    },
                 },
             },
         });
@@ -4125,14 +4384,15 @@ fn create_browser_widget(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_content_drop_zone, content_drop_preview_rect, display_terminal_title,
-        effective_drop_target_dimensions, is_localhost_input, next_active_after_tab_removal,
-        normalize_browser_entry_input, normalize_reorder_insert_index, pane_action_tooltip,
-        resolved_link_destination, select_terminal_commands, select_terminal_tab,
-        surface_hint_matches, workspace_autostart_initial_input, workspace_autostart_script,
-        ContentDropZone, TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS,
-        BROWSER_SEARCH_ENTRY_CSS_CLASSES, BROWSER_URL_ENTRY_CSS_CLASS,
-        BROWSER_URL_ENTRY_CSS_CLASSES, HOST_ENTRY_CSS_CLASS, PANE_CSS, TAB_RENAME_ENTRY_CSS_CLASS,
+        classify_content_drop_zone, content_drop_preview_rect, decide_exit_action,
+        display_terminal_title, effective_drop_target_dimensions, is_localhost_input,
+        next_active_after_tab_removal, next_fast_fail_count, normalize_browser_entry_input,
+        normalize_reorder_insert_index, pane_action_tooltip, resolved_link_destination,
+        select_terminal_commands, select_terminal_tab, surface_hint_matches,
+        workspace_autostart_initial_input, workspace_autostart_script, ContentDropZone, ExitAction,
+        TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
+        BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, FAST_FAIL_WINDOW,
+        HOST_ENTRY_CSS_CLASS, PANE_CSS, RECONNECT_FAST_FAIL_CAP, TAB_RENAME_ENTRY_CSS_CLASS,
         TAB_RENAME_ENTRY_CSS_CLASSES,
     };
     #[cfg(feature = "webkit")]
@@ -4141,6 +4401,7 @@ mod tests {
     };
     use crate::shortcut_config::{default_shortcuts, resolve_shortcuts_from_str, ShortcutId};
     use crate::{app_config::LinkOpenDestination, terminal::LinkOpenRequest};
+    use std::time::Duration;
 
     #[test]
     fn explicit_terminal_target_can_follow_the_active_tab() {
@@ -4545,5 +4806,53 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn decide_exit_action_reconnects_only_on_a_dirty_ssh_exit() {
+        // Not an auto-reconnect pane (plain shell, or SSH with the flag off):
+        // always remove, whatever the exit code.
+        assert_eq!(decide_exit_action(Some(255), false, 0), ExitAction::Remove);
+        assert_eq!(decide_exit_action(Some(0), false, 0), ExitAction::Remove);
+        assert_eq!(decide_exit_action(None, false, 0), ExitAction::Remove);
+
+        // Auto-reconnect SSH pane, but a clean exit (user ran `exit`): remove.
+        assert_eq!(decide_exit_action(Some(0), true, 0), ExitAction::Remove);
+        // Auto-reconnect SSH pane, code-less close path: cannot confirm a drop,
+        // so fall through to removal rather than reconnect.
+        assert_eq!(decide_exit_action(None, true, 0), ExitAction::Remove);
+
+        // Auto-reconnect SSH pane, non-zero exit (dropped link): reconnect.
+        assert_eq!(
+            decide_exit_action(Some(255), true, 0),
+            ExitAction::Reconnect
+        );
+        assert_eq!(decide_exit_action(Some(1), true, 0), ExitAction::Reconnect);
+    }
+
+    #[test]
+    fn decide_exit_action_gives_up_past_the_fast_fail_cap() {
+        // At and below the cap we keep reconnecting; only once the count passes
+        // the cap do we give up.
+        assert_eq!(
+            decide_exit_action(Some(255), true, RECONNECT_FAST_FAIL_CAP),
+            ExitAction::Reconnect
+        );
+        assert_eq!(
+            decide_exit_action(Some(255), true, RECONNECT_FAST_FAIL_CAP + 1),
+            ExitAction::GiveUp
+        );
+    }
+
+    #[test]
+    fn next_fast_fail_count_increments_fast_exits_and_resets_on_survival() {
+        // A session that died inside the window increments the counter.
+        assert_eq!(next_fast_fail_count(0, Some(Duration::from_millis(500))), 1);
+        assert_eq!(next_fast_fail_count(3, Some(Duration::from_secs(1))), 4);
+        // A session that survived at least the window resets the counter.
+        assert_eq!(next_fast_fail_count(4, Some(FAST_FAIL_WINDOW)), 0);
+        assert_eq!(next_fast_fail_count(4, Some(Duration::from_secs(600))), 0);
+        // An unknown spawn time is treated as a fresh (surviving) session.
+        assert_eq!(next_fast_fail_count(4, None), 0);
     }
 }
