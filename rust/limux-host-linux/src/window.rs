@@ -4604,6 +4604,21 @@ fn provision_remote_notifications(conn: layout_state::SshConnection, local_cli: 
     });
 }
 
+/// Remote command that finalizes provisioning: make the uploaded CLI executable
+/// and run `hooks setup`, pinning `LIMUX_HOOK_CLI` to the binary's *absolute*
+/// path (resolved from `$HOME` by the remote shell) so every generated agent
+/// hook invokes limux by that path rather than depending on the remote's PATH.
+///
+/// This is the crux of the feature working end-to-end: a coding agent runs its
+/// hooks in a non-login / non-interactive shell whose PATH usually does *not*
+/// include `~/.local/bin`, so a hook that called a bare `limux` would hit
+/// "command not found" and the OSC notification would be silently dropped. The
+/// whole string becomes one shell-quoted argument to `ssh`, so the *remote*
+/// shell — not the local one — expands `~` and `$HOME`; `$HOME` stays in double
+/// quotes so a home directory containing spaces still resolves correctly.
+const REMOTE_HOOKS_SETUP_COMMAND: &str =
+    "chmod +x ~/.local/bin/limux && LIMUX_HOOK_CLI=\"$HOME/.local/bin/limux\" ~/.local/bin/limux hooks setup";
+
 /// The blocking body of [`provision_remote_notifications`], run on a
 /// `gio::spawn_blocking` worker thread. Detects the remote arch first and bails
 /// (with a log line) unless it matches the local x86_64 Linux binary, then
@@ -4626,12 +4641,13 @@ fn provision_remote_notifications_blocking(conn: &layout_state::SshConnection, l
         return;
     }
 
-    // b. Upload the CLI to ~/.local/bin/limux, then chmod + run `hooks setup`.
+    // b. Upload the CLI to ~/.local/bin/limux, then chmod + run `hooks setup`
+    //    with LIMUX_HOOK_CLI pinned to the absolute path (see the const's docs).
     //    `~` is expanded by the remote shell; scp uses `-o ProxyJump` (no -J).
     let steps = [
         conn.ssh_command("mkdir -p ~/.local/bin"),
         conn.scp_command(local_cli, "~/.local/bin/limux"),
-        conn.ssh_command("chmod +x ~/.local/bin/limux && ~/.local/bin/limux hooks setup"),
+        conn.ssh_command(REMOTE_HOOKS_SETUP_COMMAND),
     ];
     for step in steps {
         // c. Each step runs via `sh -c`; a non-zero exit aborts the rest.
@@ -7287,8 +7303,8 @@ mod tests {
         workspace_notification_message, workspace_path_visible, Direction, EditableCaptureContext,
         NeighborScore, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
         PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, SshHostForm,
-        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
-        WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
+        WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, REMOTE_HOOKS_SETUP_COMMAND,
+        WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::layout_state::{LayoutNodeState, PaneState, SplitOrientation, SplitState};
     use crate::shortcut_config::{
@@ -7339,6 +7355,34 @@ mod tests {
         assert!(parse_ssh_host_form(form("a", "h", "notaport")).is_err());
         assert!(parse_ssh_host_form(form("a", "h", "70000")).is_err());
         assert!(parse_ssh_host_form(form("a", "h", "")).is_ok());
+    }
+
+    #[test]
+    fn remote_hooks_setup_command_pins_absolute_cli_path() {
+        // Regression: the agent hooks provisioning installs on the remote must
+        // invoke limux by absolute path, never a bare `limux` that depends on the
+        // remote PATH — a non-login hook shell usually lacks ~/.local/bin, so a
+        // bare `limux` there is "command not found" and the notification is
+        // silently dropped. Provisioning pins the path via LIMUX_HOOK_CLI=$HOME/…
+        assert!(
+            REMOTE_HOOKS_SETUP_COMMAND.contains("LIMUX_HOOK_CLI=\"$HOME/.local/bin/limux\""),
+            "cmd={REMOTE_HOOKS_SETUP_COMMAND}"
+        );
+        assert!(
+            REMOTE_HOOKS_SETUP_COMMAND.contains("~/.local/bin/limux hooks setup"),
+            "cmd={REMOTE_HOOKS_SETUP_COMMAND}"
+        );
+
+        // Wrapped by ssh_command the whole thing is one single-quoted argument, so
+        // the *remote* shell (not the local `sh -c`) expands `$HOME` and `~`.
+        let conn = crate::ssh_hosts::SshHost::new("vm", "example.com").to_connection();
+        let cmd = conn.ssh_command(REMOTE_HOOKS_SETUP_COMMAND);
+        assert!(
+            cmd.contains(
+                "'chmod +x ~/.local/bin/limux && LIMUX_HOOK_CLI=\"$HOME/.local/bin/limux\" ~/.local/bin/limux hooks setup'"
+            ),
+            "cmd={cmd}"
+        );
     }
 
     #[test]

@@ -1858,7 +1858,30 @@ fn hook_command(agent: agent_hooks::AgentKind, event: &str) -> Result<String> {
     ))
 }
 
+/// Normalize a raw `LIMUX_HOOK_CLI` value: trim it and treat empty/whitespace as
+/// unset. Pure so it can be unit-tested without touching the process env.
+fn normalize_hook_cli_override(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Explicit override for the CLI path baked into generated hook commands, from
+/// `LIMUX_HOOK_CLI`. Remote provisioning sets this to the *absolute* path of the
+/// uploaded binary (e.g. `$HOME/.local/bin/limux`) so the generated hooks invoke
+/// it by that path and never rely on the remote's PATH — a non-login /
+/// non-interactive hook shell usually does not have `~/.local/bin` on PATH, so a
+/// bare `limux` there resolves to "command not found" and the notification is
+/// silently dropped. Unset/empty falls back to current-exe / `limux` resolution.
+fn hook_cli_override() -> Option<String> {
+    let raw = env::var("LIMUX_HOOK_CLI").ok();
+    normalize_hook_cli_override(raw.as_deref())
+}
+
 fn hook_cli_command() -> Result<String> {
+    if let Some(cli) = hook_cli_override() {
+        return Ok(shell_single_quote(&cli));
+    }
     let exe = env::current_exe().context("failed to resolve current executable")?;
     let file_name = exe
         .file_name()
@@ -1871,6 +1894,9 @@ fn hook_cli_command() -> Result<String> {
 }
 
 fn opencode_plugin_cli_command() -> Result<String> {
+    if let Some(cli) = hook_cli_override() {
+        return Ok(cli);
+    }
     let exe = env::current_exe().context("failed to resolve current executable")?;
     let file_name = exe
         .file_name()
@@ -4158,6 +4184,26 @@ mod cli_arg_tests {
             .as_str()
             .expect("command")
             .contains("hooks claude session-start"));
+    }
+
+    #[test]
+    fn hook_cli_override_trims_and_treats_blank_as_unset() {
+        // Unset / blank -> no override (fall back to current-exe / `limux`).
+        assert_eq!(normalize_hook_cli_override(None), None);
+        assert_eq!(normalize_hook_cli_override(Some("")), None);
+        assert_eq!(normalize_hook_cli_override(Some("   ")), None);
+        // A real value is trimmed but otherwise preserved verbatim, and when a
+        // hook command embeds it it is shell-quoted so a home path with spaces
+        // (or other shell metacharacters) survives intact. This is the path
+        // remote provisioning pins so the hook never depends on the remote PATH.
+        assert_eq!(
+            normalize_hook_cli_override(Some("  /home/dev/.local/bin/limux  ")).as_deref(),
+            Some("/home/dev/.local/bin/limux")
+        );
+        let quoted = shell_single_quote(
+            &normalize_hook_cli_override(Some("/home/a b/.local/bin/limux")).expect("override"),
+        );
+        assert_eq!(quoted, "'/home/a b/.local/bin/limux'");
     }
 
     #[test]
