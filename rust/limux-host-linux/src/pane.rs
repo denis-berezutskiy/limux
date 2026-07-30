@@ -1800,6 +1800,32 @@ fn respawn_terminal_tab(
     term.handle.focus_surface();
 }
 
+/// The SSH connection of a pane's active terminal tab (falling back to any of
+/// its terminal tabs that carries one). Used so a new tab or a split in an SSH
+/// workspace opens another session on the same host instead of a local shell.
+fn active_terminal_ssh(internals: &Rc<PaneInternals>) -> Option<SshConnection> {
+    let ts = internals.tab_state.borrow();
+    let from_active = ts
+        .active_tab
+        .as_deref()
+        .and_then(|id| ts.tabs.iter().find(|entry| entry.id == id))
+        .and_then(|entry| match &entry.kind {
+            TabKind::Terminal { state } => state.ssh.clone(),
+            _ => None,
+        });
+    from_active.or_else(|| {
+        ts.tabs.iter().find_map(|entry| match &entry.kind {
+            TabKind::Terminal { state } => state.ssh.clone(),
+            _ => None,
+        })
+    })
+}
+
+/// [`active_terminal_ssh`] resolved from a pane widget, for split callers.
+pub fn active_terminal_ssh_for_widget(pane_widget: &gtk::Widget) -> Option<SshConnection> {
+    find_pane_internals(pane_widget).and_then(|internals| active_terminal_ssh(&internals))
+}
+
 fn add_terminal_tab_inner(
     internals: &Rc<PaneInternals>,
     working_directory: Option<&str>,
@@ -1822,7 +1848,30 @@ fn add_terminal_tab_inner(
     // itself host the agent) is what we want to re-establish. Either way this
     // restored command takes precedence over a workspace autostart command,
     // just as a resumed agent does.
-    let ssh_connection = options.as_ref().and_then(|value| value.ssh.clone());
+    //
+    // A plain "new tab" (the + button) carries no explicit ssh/agent; inherit
+    // the pane's SSH connection so it stays on the same host as the rest of the
+    // workspace rather than dropping to a local shell.
+    let ssh_connection = options
+        .as_ref()
+        .and_then(|value| value.ssh.clone())
+        .or_else(|| {
+            let is_agent = options
+                .as_ref()
+                .and_then(|value| value.agent.as_ref())
+                .is_some();
+            if is_agent {
+                None
+            } else {
+                // Give the inherited tab its own remote tmux session (keyed by this
+                // tab's stable id) so it's independent from the tab it inherited the
+                // host from, yet reattaches to the same session on restore.
+                active_terminal_ssh(internals).map(|mut conn| {
+                    conn.remote_session_name = Some(tab_id.clone());
+                    conn
+                })
+            }
+        });
     let restored_agent_command = ssh_connection
         .as_ref()
         .map(|ssh| ssh.reconnect_command())

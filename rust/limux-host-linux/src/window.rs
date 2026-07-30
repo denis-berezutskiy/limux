@@ -6105,6 +6105,17 @@ fn split_pane(
         return None;
     }
 
+    // Inherit the SSH connection from the pane being split, so a split in an
+    // SSH workspace opens another session on the same host (reusing the same
+    // restore path connect uses) rather than a local shell. Each split gets its
+    // own remote tmux session (unique + restore-stable) so the two panes don't
+    // attach the same session and clamp each other's size.
+    let initial_state = options.initial_state.or_else(|| {
+        pane::active_terminal_ssh_for_widget(pane_widget).map(|mut ssh| {
+            ssh.remote_session_name = Some(uuid::Uuid::new_v4().to_string());
+            PaneState::ssh(wd.as_deref(), ssh)
+        })
+    });
     let new_pane = create_pane_for_workspace(
         state,
         &shortcuts,
@@ -6112,7 +6123,7 @@ fn split_pane(
         wd.as_deref(),
         autostart_command,
         PaneCreationOptions {
-            initial_state: options.initial_state.as_ref(),
+            initial_state: initial_state.as_ref(),
             skip_default_tab: options.skip_default_tab,
             suppress_initial_autostart: options.suppress_initial_autostart,
         },
