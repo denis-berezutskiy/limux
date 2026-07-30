@@ -4581,7 +4581,109 @@ fn connect_ssh_host(state: &State, host: &crate::ssh_hosts::SshHost) {
         layout: LayoutNodeState::Pane(PaneState::ssh(None, host.to_connection())),
     };
     add_workspace_from_state(state, &workspace);
+    // Opt-in: push the limux CLI + agent hooks to the remote so its coding
+    // agents' notifications reach this machine. Best-effort and off the GTK loop.
+    if host.provision_notifications {
+        provision_remote_notifications(host.to_connection(), layout_state::limux_cli_executable());
+    }
     request_session_save(state);
+}
+
+/// Provision agent-hook notifications on a freshly-connected SSH host so a
+/// remote coding agent's OSC notifications reach this machine automatically.
+/// Best-effort and entirely off the GTK main loop: the whole sequence (arch
+/// probe, `mkdir`, `scp` of the local CLI, `chmod` + `limux hooks setup`) runs
+/// on a `gio::spawn_blocking` worker thread. Nothing here touches GTK widgets,
+/// so the work needs no hop back to the main thread; the outer `spawn_local`
+/// only drives the blocking future, mirroring `pane::resolve_pasted_image_for_tab`.
+fn provision_remote_notifications(conn: layout_state::SshConnection, local_cli: String) {
+    glib::MainContext::default().spawn_local(async move {
+        let _ =
+            gio::spawn_blocking(move || provision_remote_notifications_blocking(&conn, &local_cli))
+                .await;
+    });
+}
+
+/// The blocking body of [`provision_remote_notifications`], run on a
+/// `gio::spawn_blocking` worker thread. Detects the remote arch first and bails
+/// (with a log line) unless it matches the local x86_64 Linux binary, then
+/// uploads the CLI and runs `hooks setup`. Every step logs its own outcome;
+/// provisioning is strictly best-effort and never panics or blocks the UI.
+fn provision_remote_notifications_blocking(conn: &layout_state::SshConnection, local_cli: &str) {
+    let host = conn.host.as_str();
+
+    // a. Detect the remote arch. The local binary is x86_64 Linux, so anything
+    //    else can't run there — skip rather than upload an unusable binary.
+    let arch = match run_provision_capture(&conn.ssh_command("uname -s -m")) {
+        Some(arch) => arch,
+        None => {
+            eprintln!("limux: remote provisioning skipped (could not detect arch on {host})");
+            return;
+        }
+    };
+    if arch != "Linux x86_64" {
+        eprintln!("limux: remote provisioning skipped (arch {arch}; local binary is x86_64 linux)");
+        return;
+    }
+
+    // b. Upload the CLI to ~/.local/bin/limux, then chmod + run `hooks setup`.
+    //    `~` is expanded by the remote shell; scp uses `-o ProxyJump` (no -J).
+    let steps = [
+        conn.ssh_command("mkdir -p ~/.local/bin"),
+        conn.scp_command(local_cli, "~/.local/bin/limux"),
+        conn.ssh_command("chmod +x ~/.local/bin/limux && ~/.local/bin/limux hooks setup"),
+    ];
+    for step in steps {
+        // c. Each step runs via `sh -c`; a non-zero exit aborts the rest.
+        if !run_provision_step(&step) {
+            eprintln!("limux: remote provisioning of agent notifications on {host} failed");
+            return;
+        }
+    }
+    eprintln!("limux: provisioned remote agent notifications on {host}");
+}
+
+/// Run a shell-quoted command (from the ssh/scp builders) to completion,
+/// returning whether it exited zero. Mirrors `pane::run_scp_command`: handed to
+/// `sh -c`, stderr inherited so failures are visible. Called only from a
+/// `gio::spawn_blocking` worker thread — the subprocess is blocking.
+fn run_provision_step(command: &str) -> bool {
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+    {
+        Ok(status) => status.success(),
+        Err(err) => {
+            eprintln!("limux: remote provisioning: failed to spawn `sh -c`: {err}");
+            false
+        }
+    }
+}
+
+/// Run a shell-quoted command and capture its trimmed stdout on success (used to
+/// probe the remote architecture). Returns `None` if it can't be spawned or
+/// exits non-zero. Blocking — called only from a `gio::spawn_blocking` worker.
+fn run_provision_capture(command: &str) -> Option<String> {
+    match std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+        Ok(_) => None,
+        Err(err) => {
+            eprintln!("limux: remote provisioning: failed to spawn `sh -c`: {err}");
+            None
+        }
+    }
 }
 
 /// Raw SSH-dialog field values, grouped so the parser stays one pure function
@@ -4595,6 +4697,7 @@ struct SshHostForm<'a> {
     proxy_jump: &'a str,
     persist_tmux: bool,
     auto_reconnect: bool,
+    provision_notifications: bool,
 }
 
 /// Build an `SshHost` from raw dialog field text (pure; no GTK). Validates that
@@ -4635,6 +4738,7 @@ fn parse_ssh_host_form(form: SshHostForm<'_>) -> Result<crate::ssh_hosts::SshHos
         proxy_jump: optional(form.proxy_jump),
         persist_tmux: form.persist_tmux,
         auto_reconnect: form.auto_reconnect,
+        provision_notifications: form.provision_notifications,
         from_ssh_config: false,
     })
 }
@@ -4682,8 +4786,14 @@ fn show_ssh_host_dialog(state: &State, existing: Option<usize>) {
     let browse_button = gtk::Button::with_label("Browse...");
     let persist_check = gtk::CheckButton::with_label("Keep session alive with remote tmux");
     let reconnect_check = gtk::CheckButton::with_label("Auto-reconnect on drop");
+    let provision_check = gtk::CheckButton::with_label(
+        "Set up remote agent notifications (uploads limux-cli + hooks to the host)",
+    );
     persist_check.set_active(true);
     reconnect_check.set_active(true);
+    // Off by default: provisioning does extra work (arch probe + upload + setup)
+    // on connect, so it's strictly opt-in per host.
+    provision_check.set_active(false);
 
     if let Some(host) = existing_host.as_ref() {
         alias_entry.set_text(&host.alias);
@@ -4702,6 +4812,7 @@ fn show_ssh_host_dialog(state: &State, existing: Option<usize>) {
         }
         persist_check.set_active(host.persist_tmux);
         reconnect_check.set_active(host.auto_reconnect);
+        provision_check.set_active(host.provision_notifications);
     }
 
     let error_label = gtk::Label::builder()
@@ -4743,6 +4854,7 @@ fn show_ssh_host_dialog(state: &State, existing: Option<usize>) {
     content.append(&ssh_form_row("ProxyJump", &proxy_entry));
     content.append(&persist_check);
     content.append(&reconnect_check);
+    content.append(&provision_check);
     content.append(&error_label);
 
     let buttons = gtk::Box::builder()
@@ -4807,6 +4919,7 @@ fn show_ssh_host_dialog(state: &State, existing: Option<usize>) {
         let proxy_entry = proxy_entry.clone();
         let persist_check = persist_check.clone();
         let reconnect_check = reconnect_check.clone();
+        let provision_check = provision_check.clone();
         let error_label = error_label.clone();
         save_button.connect_clicked(move |_| {
             // Bind the GString values so the borrowed &str form fields outlive the call.
@@ -4825,6 +4938,7 @@ fn show_ssh_host_dialog(state: &State, existing: Option<usize>) {
                 proxy_jump: proxy_jump.as_str(),
                 persist_tmux: persist_check.is_active(),
                 auto_reconnect: reconnect_check.is_active(),
+                provision_notifications: provision_check.is_active(),
             }) {
                 Ok(host) => {
                     let hosts = {
@@ -7192,6 +7306,7 @@ mod tests {
             proxy_jump: "bastion",
             persist_tmux: true,
             auto_reconnect: false,
+            provision_notifications: true,
         })
         .expect("valid form");
         assert_eq!(host.alias, "dev");
@@ -7202,6 +7317,7 @@ mod tests {
         assert_eq!(host.proxy_jump.as_deref(), Some("bastion"));
         assert!(host.persist_tmux);
         assert!(!host.auto_reconnect);
+        assert!(host.provision_notifications);
         assert!(!host.from_ssh_config);
     }
 
@@ -7216,6 +7332,7 @@ mod tests {
             proxy_jump: "",
             persist_tmux: true,
             auto_reconnect: true,
+            provision_notifications: false,
         };
         assert!(parse_ssh_host_form(form("", "h", "")).is_err());
         assert!(parse_ssh_host_form(form("a", "", "")).is_err());

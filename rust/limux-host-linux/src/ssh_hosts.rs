@@ -39,6 +39,11 @@ pub struct SshHost {
     pub persist_tmux: bool,
     #[serde(default = "default_true")]
     pub auto_reconnect: bool,
+    /// Opt-in: on connect, upload the local `limux` CLI to the remote and run
+    /// `limux hooks setup` there so a remote coding agent's notifications reach
+    /// this machine automatically. Off by default (does extra work on connect).
+    #[serde(default)]
+    pub provision_notifications: bool,
     /// True when discovered from `~/.ssh/config` rather than user-saved. These
     /// are shown in the sidebar but not written back to `ssh_hosts.json`.
     #[serde(default, skip_serializing)]
@@ -60,6 +65,7 @@ impl SshHost {
             proxy_jump: None,
             persist_tmux: true,
             auto_reconnect: true,
+            provision_notifications: false,
             from_ssh_config: false,
         }
     }
@@ -314,6 +320,22 @@ Host prod
         assert!(cmd.contains("command -v tmux"));
         assert!(cmd.contains("TERM=xterm-256color"));
         assert!(cmd.contains("ServerAliveInterval"));
+    }
+
+    #[test]
+    fn provision_notifications_defaults_off_and_survives_absent_json() {
+        // Opt-in: a freshly-built host and an older ssh_hosts.json that predates
+        // the field must both read as false, never surprising a user with uploads.
+        assert!(!SshHost::new("dev", "h").provision_notifications);
+        let host: SshHost =
+            serde_json::from_str(r#"{"alias":"dev","host_name":"h"}"#).expect("decode");
+        assert!(!host.provision_notifications);
+
+        let mut opted_in = SshHost::new("dev", "h");
+        opted_in.provision_notifications = true;
+        let json = serde_json::to_string(&opted_in).expect("encode");
+        let round: SshHost = serde_json::from_str(&json).expect("decode round-trip");
+        assert!(round.provision_notifications);
     }
 
     #[test]

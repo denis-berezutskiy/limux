@@ -334,6 +334,44 @@ impl SshConnection {
             .collect::<Vec<_>>()
             .join(" ")
     }
+
+    /// Build the `ssh` command that runs `remote_command` on this connection's
+    /// host, parallel to [`scp_command`](Self::scp_command). Mirrors that flag
+    /// handling — `-p` (lowercase) for the port, `-i` for the identity file,
+    /// `-o ProxyJump=<host>` for a jump host — and adds `-o BatchMode=yes` so a
+    /// non-interactive provisioning run never blocks on a password prompt.
+    /// `remote_command` becomes a single shell-quoted argument to `ssh`, and
+    /// every part is single-quoted, so the whole string is safe to hand to a
+    /// shell (e.g. `sh -c`).
+    pub fn ssh_command(&self, remote_command: &str) -> String {
+        let mut parts: Vec<String> = vec!["ssh".to_string()];
+        if let Some(port) = self.port {
+            parts.push("-p".to_string());
+            parts.push(port.to_string());
+        }
+        if let Some(identity) = self.identity_file.as_deref().and_then(normalized_str) {
+            parts.push("-i".to_string());
+            parts.push(identity);
+        }
+        if let Some(proxy) = self.proxy_jump.as_deref().and_then(normalized_str) {
+            parts.push("-o".to_string());
+            parts.push(format!("ProxyJump={proxy}"));
+        }
+        parts.push("-o".to_string());
+        parts.push("BatchMode=yes".to_string());
+        let target = match self.user.as_deref().and_then(normalized_str) {
+            Some(user) => format!("{user}@{}", self.host),
+            None => self.host.clone(),
+        };
+        parts.push(target);
+        parts.push(remote_command.to_string());
+
+        parts
+            .iter()
+            .map(|part| shell_single_quote(part))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -952,7 +990,11 @@ fn wrap_restored_agent_command(
     format!("{run_command}; limux_agent_status=$?; {cleanup}; exec \"${{SHELL:-/bin/sh}}\" -l")
 }
 
-fn limux_cli_executable() -> String {
+/// Resolve the local `limux` CLI path: the sibling `limux-cli` next to the
+/// running executable (dev build), else the installed `bin/limux`, else the
+/// bare name `limux` from `PATH`. Reused by remote provisioning to know which
+/// local binary to upload to a host.
+pub fn limux_cli_executable() -> String {
     std::env::current_exe()
         .ok()
         .and_then(|path| {
@@ -1200,6 +1242,51 @@ mod tests {
         // No user configured -> bare host target, no '@'.
         assert!(cmd.contains("'host:/r.png'"), "cmd={cmd}");
         assert!(!cmd.contains('@'), "cmd={cmd}");
+    }
+
+    #[test]
+    fn ssh_command_includes_batchmode_target_and_quoted_remote_command() {
+        let conn = ssh_conn(
+            "example.com",
+            Some("alice"),
+            Some(2222),
+            Some("/home/alice/.ssh/id_ed25519"),
+            Some("jump.example"),
+        );
+        let cmd = conn.ssh_command("uname -s -m");
+
+        assert!(cmd.starts_with("'ssh'"), "cmd={cmd}");
+        // ssh spells the port -p (lowercase), unlike scp's -P.
+        assert!(cmd.contains("'-p' '2222'"), "cmd={cmd}");
+        assert!(!cmd.contains("'-P'"), "cmd={cmd}");
+        assert!(
+            cmd.contains("'-i' '/home/alice/.ssh/id_ed25519'"),
+            "cmd={cmd}"
+        );
+        // ssh takes ProxyJump via -o (mirrors scp_command), and BatchMode keeps a
+        // non-interactive provisioning run from hanging on a password prompt.
+        assert!(cmd.contains("'-o' 'ProxyJump=jump.example'"), "cmd={cmd}");
+        assert!(cmd.contains("'-o' 'BatchMode=yes'"), "cmd={cmd}");
+        assert!(cmd.contains("'alice@example.com'"), "cmd={cmd}");
+        // The remote command is passed as one shell-quoted argument to ssh.
+        assert!(cmd.contains("'uname -s -m'"), "cmd={cmd}");
+    }
+
+    #[test]
+    fn ssh_command_uses_bare_host_without_user_and_quotes_compound_command() {
+        let conn = ssh_conn("host", None, None, None, None);
+        let cmd = conn.ssh_command("chmod +x ~/.local/bin/limux && ~/.local/bin/limux hooks setup");
+
+        // No user configured -> bare host target, no '@'.
+        assert!(cmd.contains("'host'"), "cmd={cmd}");
+        assert!(!cmd.contains('@'), "cmd={cmd}");
+        assert!(cmd.contains("'-o' 'BatchMode=yes'"), "cmd={cmd}");
+        // The whole compound remote command survives as a single quoted argument,
+        // so the remote shell (not the local one) interprets the `&&`.
+        assert!(
+            cmd.contains("'chmod +x ~/.local/bin/limux && ~/.local/bin/limux hooks setup'"),
+            "cmd={cmd}"
+        );
     }
 
     #[test]
