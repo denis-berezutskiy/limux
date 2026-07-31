@@ -4841,13 +4841,31 @@ fn parse_ssh_host_form(form: SshHostForm<'_>) -> Result<crate::ssh_hosts::SshHos
             Some(value.to_string())
         }
     };
+    let user = optional(form.user);
+    let identity_file = optional(form.identity_file);
+    let proxy_jump = optional(form.proxy_jump);
+    // Reject values that begin with `-`. Passed to ssh/scp (or, for the alias,
+    // to `tmux -s`) a `-`-leading token is parsed as an option — e.g. an alias
+    // or host of `-oProxyCommand=…` would make ssh run an arbitrary command
+    // locally the moment the user connects. `--` in the arg builders is the
+    // second layer; rejecting here keeps such an entry from ever being saved.
+    for (label, value) in [
+        ("Alias", Some(alias)),
+        ("HostName", Some(host_name)),
+        ("User", user.as_deref()),
+        ("ProxyJump", proxy_jump.as_deref()),
+    ] {
+        if value.is_some_and(|value| value.starts_with('-')) {
+            return Err(format!("{label} must not start with '-'"));
+        }
+    }
     Ok(crate::ssh_hosts::SshHost {
         alias: alias.to_string(),
         host_name: host_name.to_string(),
-        user: optional(form.user),
+        user,
         port,
-        identity_file: optional(form.identity_file),
-        proxy_jump: optional(form.proxy_jump),
+        identity_file,
+        proxy_jump,
         persist_tmux: form.persist_tmux,
         auto_reconnect: form.auto_reconnect,
         provision_notifications: form.provision_notifications,
@@ -7454,6 +7472,32 @@ mod tests {
         assert!(parse_ssh_host_form(form("a", "h", "notaport")).is_err());
         assert!(parse_ssh_host_form(form("a", "h", "70000")).is_err());
         assert!(parse_ssh_host_form(form("a", "h", "")).is_ok());
+    }
+
+    #[test]
+    fn parse_ssh_host_form_rejects_dash_leading_values() {
+        // A `-`-leading alias/host/user/proxy would be parsed as an ssh/scp/tmux
+        // option (e.g. `-oProxyCommand=…` → local command execution) — reject it
+        // so such an entry can never be saved.
+        let field = |name: &'static str, value: &'static str| SshHostForm {
+            alias: if name == "alias" { value } else { "a" },
+            host_name: if name == "host" { value } else { "h" },
+            user: if name == "user" { value } else { "" },
+            port: "",
+            identity_file: "",
+            proxy_jump: if name == "proxy" { value } else { "" },
+            persist_tmux: true,
+            auto_reconnect: true,
+            provision_notifications: false,
+        };
+        for name in ["alias", "host", "user", "proxy"] {
+            assert!(
+                parse_ssh_host_form(field(name, "-oProxyCommand=x")).is_err(),
+                "{name} starting with - must be rejected"
+            );
+        }
+        // A legitimate host with a hyphen later in the value is fine.
+        assert!(parse_ssh_host_form(field("host", "my-host")).is_ok());
     }
 
     #[test]

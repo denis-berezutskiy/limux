@@ -71,7 +71,28 @@ impl SshHost {
     }
 
     /// Map an address-book entry to the connection a tab persists/reconnects with.
+    ///
+    /// For a host discovered from `~/.ssh/config`, connect through the **alias
+    /// itself** (`ssh <alias>`) rather than the parsed fields, so OpenSSH applies
+    /// the entire matching `Host` block — `HostName`, `User`, `Port`,
+    /// `IdentityFile`, `ProxyJump`, plus `Include` / `Match` / tokens / arbitrary
+    /// options that our lightweight sidebar parser deliberately doesn't model. The
+    /// parsed fields still populate the sidebar row for display; they just don't
+    /// drive the connection, so a config host always resolves exactly as the
+    /// user's own `ssh <alias>` would. User-saved hosts keep their explicit fields.
     pub fn to_connection(&self) -> SshConnection {
+        if self.from_ssh_config {
+            return SshConnection {
+                host: self.alias.clone(),
+                user: None,
+                port: None,
+                identity_file: None,
+                proxy_jump: None,
+                remote_session_name: normalize(Some(self.alias.as_str())),
+                persist_tmux: self.persist_tmux,
+                auto_reconnect: self.auto_reconnect,
+            };
+        }
         SshConnection {
             host: self.host_name.clone(),
             user: normalize(self.user.as_deref()),
@@ -224,7 +245,24 @@ pub fn parse_ssh_config(text: &str) -> Vec<SshHost> {
     if let Some(host) = current.take() {
         hosts.push(host);
     }
+    // Drop any host whose alias/hostname/user/proxy begins with `-`. Connecting
+    // reaches these values into ssh/scp/tmux argument vectors, where a `-`-leading
+    // token is parsed as an option (e.g. `-oProxyCommand=…` → local command
+    // execution). A hostile or malformed `~/.ssh/config` must not be able to plant
+    // one just by sitting on disk.
+    hosts.retain(|host| {
+        !dash_leading(Some(&host.alias))
+            && !dash_leading(Some(&host.host_name))
+            && !dash_leading(host.user.as_deref())
+            && !dash_leading(host.proxy_jump.as_deref())
+    });
     hosts
+}
+
+/// True when a value begins with `-` (and would therefore be misparsed as an
+/// ssh/scp/tmux option). Empty/absent values are safe.
+fn dash_leading(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value.starts_with('-'))
 }
 
 fn split_key_value(line: &str) -> (&str, &str) {
@@ -322,6 +360,55 @@ Host prod
         assert!(cmd.contains("command -v tmux"));
         assert!(cmd.contains("TERM=xterm-256color"));
         assert!(cmd.contains("ServerAliveInterval"));
+    }
+
+    #[test]
+    fn config_host_connects_via_alias_not_parsed_fields() {
+        // A ~/.ssh/config-discovered host connects through the alias so OpenSSH
+        // applies the whole Host block; the parsed fields are display-only.
+        let mut host = SshHost::new("myvm", "10.0.0.9");
+        host.user = Some("bob".to_string());
+        host.port = Some(2200);
+        host.from_ssh_config = true;
+
+        let conn = host.to_connection();
+        assert_eq!(conn.host, "myvm");
+        assert_eq!(conn.user, None);
+        assert_eq!(conn.port, None);
+        assert_eq!(conn.identity_file, None);
+        assert_eq!(conn.remote_session_name.as_deref(), Some("myvm"));
+
+        let cmd = conn.reconnect_command();
+        assert!(cmd.contains("'myvm'"), "cmd={cmd}");
+        // The parsed hostname/user/port must NOT drive the connection.
+        assert!(!cmd.contains("10.0.0.9"), "cmd={cmd}");
+        assert!(!cmd.contains("bob@"), "cmd={cmd}");
+
+        // A user-saved host (not from config) still uses its explicit fields.
+        let mut saved = SshHost::new("myvm", "10.0.0.9");
+        saved.user = Some("bob".to_string());
+        let saved = saved.to_connection();
+        assert_eq!(saved.host, "10.0.0.9");
+        assert_eq!(saved.user.as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn parse_ssh_config_drops_dash_leading_injection_hosts() {
+        // A hostile config whose Host pattern or HostName begins with `-` would be
+        // misparsed as an ssh option when we connect — drop such entries entirely.
+        let cfg = "\
+Host good
+    HostName 10.0.0.1
+Host -oProxyCommand=touch\x20pwned
+    HostName x
+Host evil
+    HostName -oProxyCommand=touch\x20pwned
+";
+        let hosts = parse_ssh_config(cfg);
+        let aliases: Vec<&str> = hosts.iter().map(|h| h.alias.as_str()).collect();
+        assert_eq!(aliases, vec!["good"]);
+        assert!(!hosts.iter().any(|h| h.alias.starts_with('-')));
+        assert!(!hosts.iter().any(|h| h.host_name.starts_with('-')));
     }
 
     #[test]

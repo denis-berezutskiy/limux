@@ -257,6 +257,7 @@ impl SshConnection {
         parts.push("ServerAliveInterval=15".to_string());
         parts.push("-o".to_string());
         parts.push("ServerAliveCountMax=3".to_string());
+        push_connection_sharing(&mut parts);
         if self.persist_tmux {
             // Force a PTY so tmux runs interactively.
             parts.push("-t".to_string());
@@ -265,6 +266,9 @@ impl SshConnection {
             Some(user) => format!("{user}@{}", self.host),
             None => self.host.clone(),
         };
+        // `--` terminates option parsing so a target that begins with `-` (e.g. a
+        // hostile `~/.ssh/config` alias) can't be smuggled in as an ssh option.
+        parts.push("--".to_string());
         parts.push(target);
 
         let mut command = parts
@@ -323,6 +327,10 @@ impl SshConnection {
             parts.push("-o".to_string());
             parts.push(format!("ProxyJump={proxy}"));
         }
+        push_connection_sharing(&mut parts);
+        // `--` terminates option parsing before the positional source/target so a
+        // `-`-leading host can't be reinterpreted as an scp option.
+        parts.push("--".to_string());
         parts.push(local_path.to_string());
         let target = match self.user.as_deref().and_then(normalized_str) {
             Some(user) => format!("{user}@{}:{remote_path}", self.host),
@@ -361,10 +369,14 @@ impl SshConnection {
         }
         parts.push("-o".to_string());
         parts.push("BatchMode=yes".to_string());
+        push_connection_sharing(&mut parts);
         let target = match self.user.as_deref().and_then(normalized_str) {
             Some(user) => format!("{user}@{}", self.host),
             None => self.host.clone(),
         };
+        // `--` terminates option parsing so a `-`-leading target can't be
+        // reinterpreted as an ssh option (defence-in-depth with parse-time checks).
+        parts.push("--".to_string());
         parts.push(target);
         parts.push(remote_command.to_string());
 
@@ -1246,6 +1258,23 @@ fn normalized_str(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+/// Append OpenSSH connection-sharing options so every ssh/scp to a host reuses
+/// one authenticated master instead of re-authenticating each time. Without this
+/// a password/2FA host re-prompts on every auto-reconnect, image-paste scp,
+/// split, and provisioning step. `ControlMaster=auto` opens the master on first
+/// use and reuses it (falling back to a fresh direct connection if the socket is
+/// stale/dead, so it never wedges); the socket is keyed by `%C` (a hash of the
+/// connection tuple) and `%i` (local uid) so it is shared only across identical
+/// targets for this user. Mirrors cmux's `SSHConnectionSharingOptions`.
+fn push_connection_sharing(parts: &mut Vec<String>) {
+    parts.push("-o".to_string());
+    parts.push("ControlMaster=auto".to_string());
+    parts.push("-o".to_string());
+    parts.push("ControlPath=/tmp/limux-ssh-%i-%C".to_string());
+    parts.push("-o".to_string());
+    parts.push("ControlPersist=600".to_string());
+}
+
 fn shell_single_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -1400,6 +1429,27 @@ mod tests {
             cmd.contains("'chmod +x ~/.local/bin/limux && ~/.local/bin/limux hooks setup'"),
             "cmd={cmd}"
         );
+    }
+
+    #[test]
+    fn command_builders_share_connections_and_terminate_options() {
+        let conn = ssh_conn("h", Some("u"), Some(22), None, None);
+        for cmd in [
+            conn.reconnect_command(),
+            conn.scp_command("/tmp/l.png", "/tmp/r.png"),
+            conn.ssh_command("echo hi"),
+        ] {
+            // ControlMaster sharing on every ssh/scp so repeated connections to the
+            // same host reuse one authenticated master (no re-auth per action).
+            assert!(cmd.contains("'-o' 'ControlMaster=auto'"), "cmd={cmd}");
+            assert!(
+                cmd.contains("'-o' 'ControlPath=/tmp/limux-ssh-%i-%C'"),
+                "cmd={cmd}"
+            );
+            assert!(cmd.contains("'-o' 'ControlPersist=600'"), "cmd={cmd}");
+            // `--` terminates options before the (attacker-influenceable) target.
+            assert!(cmd.contains("'--'"), "cmd={cmd}");
+        }
     }
 
     #[test]
