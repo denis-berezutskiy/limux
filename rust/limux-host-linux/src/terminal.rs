@@ -2127,9 +2127,8 @@ pub fn create_terminal(
         let right_click = gtk::GestureClick::new();
         right_click.set_button(3);
         right_click.connect_pressed(move |gesture, _n, x, y| {
-            let surface = *sc.borrow();
             let mods = translate_mouse_mods(gesture.current_event_state());
-            show_terminal_context_menu(&gl, &overlay, surface, &callbacks, x, y, mods);
+            show_terminal_context_menu(&gl, &overlay, &sc, &callbacks, x, y, mods);
             gesture.set_state(gtk::EventSequenceState::Claimed);
         });
         controllers.borrow_mut().push(right_click.clone().upcast());
@@ -2444,7 +2443,7 @@ fn build_submenu_button(label: &str, popover: &gtk::Popover) -> gtk::MenuButton 
 fn show_terminal_context_menu(
     gl_area: &gtk::GLArea,
     overlay: &gtk::Overlay,
-    surface: Option<ghostty_surface_t>,
+    surface_cell: &Rc<RefCell<Option<ghostty_surface_t>>>,
     callbacks: &Rc<RefCell<TerminalCallbacks>>,
     x: f64,
     y: f64,
@@ -2455,6 +2454,11 @@ fn show_terminal_context_menu(
     }
 
     let menu_box = build_popover_inner_box();
+
+    // Snapshot the current surface for the synchronous actions (copy/clear); the
+    // deferred "Paste" path re-reads the cell so it always targets the live
+    // surface even if the pane's surface was swapped (e.g. by auto-reconnect).
+    let surface = *surface_cell.borrow();
     let url = url_at_position(surface, x, y, mods);
 
     let has_selection = surface
@@ -2569,6 +2573,7 @@ fn show_terminal_context_menu(
             let label = btn.label().unwrap_or_default().to_string();
             let pop = popover.downgrade();
             let cb = callbacks.clone();
+            let sc = surface_cell.clone();
             let gl_area = gl_area.clone();
             let url = url.clone();
             let overlay = overlay.clone();
@@ -2586,7 +2591,22 @@ fn show_terminal_context_menu(
                             show_clipboard_toast(&overlay);
                         }
                     }
-                    "Paste" => surface_action(surface, "paste_from_clipboard"),
+                    "Paste" => {
+                        // Mirror Ctrl+V: attempt an image paste first, fall back
+                        // to ghostty's text paste when the clipboard holds no
+                        // image. Deferred to the next loop iteration so the
+                        // popover's grab is fully released first — pasting while
+                        // the autohide popover still holds its grab can leave the
+                        // menu wedged open and floating above other windows on
+                        // Wayland, and never inserts the image.
+                        let sc = sc.clone();
+                        let cb = cb.clone();
+                        glib::idle_add_local_once(move || {
+                            if !try_begin_image_paste(&sc, &cb) {
+                                surface_action(*sc.borrow(), "paste_from_clipboard");
+                            }
+                        });
+                    }
                     "Browser" => {
                         let callbacks = cb.borrow();
                         (callbacks.on_open_browser_here)();
