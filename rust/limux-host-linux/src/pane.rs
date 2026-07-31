@@ -293,6 +293,14 @@ const FAST_FAIL_WINDOW: Duration = Duration::from_secs(3);
 /// permanently-broken target (dead host, auth failure) from looping forever.
 const RECONNECT_FAST_FAIL_CAP: u32 = 5;
 
+/// Exit codes that mean the SSH *transport* failed rather than a remote program
+/// exiting non-zero: OpenSSH reports 255 for its own errors (connection
+/// refused/reset/timeout), and the tmux-reattach wrapper can surface 251/254 for
+/// a lost session. Only these (or a session that died during startup) should
+/// trigger an auto-reconnect — a long-lived session that exits non-zero for
+/// another reason is the user's actual result and must not be relaunched.
+const SSH_TRANSPORT_LOSS_CODES: [i32; 3] = [251, 254, 255];
+
 /// What to do when a terminal's child process exits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExitAction {
@@ -324,26 +332,44 @@ fn next_fast_fail_count(prev: u32, session_duration: Option<Duration>) -> u32 {
 /// * `fast_fail_count` — consecutive fast failures, already updated for this
 ///   exit (see [`next_fast_fail_count`]).
 ///
-/// Only a confirmed non-zero exit on an auto-reconnect SSH pane reconnects. A
-/// clean exit (code 0), a code-less close (`None`), or any non-reconnect pane
-/// is removed. Once the fast-failure count passes [`RECONNECT_FAST_FAIL_CAP`]
-/// we give up (which also removes the tab).
+/// An auto-reconnect SSH pane reconnects only when the exit looks like a lost
+/// *connection*: a [transport-loss code](SSH_TRANSPORT_LOSS_CODES), or a session
+/// that died within [`FAST_FAIL_WINDOW`] of spawning (the surface-realization
+/// startup race, where the first ssh can exit spuriously — often 127 — before
+/// the pane is up). A clean exit (0), a code-less close (`None`), a non-reconnect
+/// pane, or a *long-lived* session that exits non-zero for some other reason (a
+/// remote command genuinely failing — the user's result) is removed. Once the
+/// fast-failure count passes [`RECONNECT_FAST_FAIL_CAP`] we give up.
 fn decide_exit_action(
     exit_code: Option<i32>,
     auto_reconnect: bool,
     fast_fail_count: u32,
+    session_duration: Option<Duration>,
 ) -> ExitAction {
     if !auto_reconnect {
         return ExitAction::Remove;
     }
-    let dropped = matches!(exit_code, Some(code) if code != 0);
-    if !dropped {
+    let Some(code) = exit_code.filter(|code| *code != 0) else {
         return ExitAction::Remove;
-    }
+    };
     if fast_fail_count > RECONNECT_FAST_FAIL_CAP {
         return ExitAction::GiveUp;
     }
-    ExitAction::Reconnect
+    let transport_loss = SSH_TRANSPORT_LOSS_CODES.contains(&code);
+    let died_during_startup = session_duration.is_some_and(|d| d < FAST_FAIL_WINDOW);
+    if transport_loss || died_during_startup {
+        ExitAction::Reconnect
+    } else {
+        ExitAction::Remove
+    }
+}
+
+/// Capped exponential backoff before an auto-reconnect: 200 ms doubling per
+/// consecutive fast failure, capped at 3200 ms (0.2, 0.4, 0.8, 1.6, 3.2 s, then
+/// flat). Beyond politeness this gives the surface/PTY time to settle so the
+/// startup-race respawn doesn't hammer the storm cap.
+fn reconnect_delay_ms(fast_fail_count: u32) -> u64 {
+    (200u64 << fast_fail_count.saturating_sub(1).min(4)).min(3200)
 }
 
 #[derive(Clone)]
@@ -1693,18 +1719,13 @@ fn handle_terminal_exit(
     // Claim this exit before acting so a late second fire is a no-op.
     in_flight.set(true);
 
-    match decide_exit_action(exit_code, auto_reconnect, fast_fail_count) {
+    match decide_exit_action(exit_code, auto_reconnect, fast_fail_count, session_duration) {
         ExitAction::Reconnect => {
             let command = ssh
                 .as_ref()
                 .expect("Reconnect action implies an SSH connection")
                 .reconnect_command();
-            // Capped exponential backoff between reconnects. Beyond politeness this
-            // gives the surface/PTY time to settle: right after an app launch the
-            // first ssh can exit spuriously before the pane is realized, and an
-            // instant respawn would hammer it up to the storm cap. Spacing the
-            // retries (0.2s, 0.4s, 0.8s, 1.6s, 3.2s) lets it stabilize.
-            let delay_ms = (200u64 << fast_fail_count.saturating_sub(1).min(4)).min(3200);
+            let delay_ms = reconnect_delay_ms(fast_fail_count);
             eprintln!(
                 "limux: ssh pane surface={pane_id}:{tab_id} exited (code={exit_code:?}); \
                  auto-reconnecting in {delay_ms}ms (fast_fail_count={fast_fail_count})"
@@ -4533,12 +4554,13 @@ mod tests {
         classify_content_drop_zone, content_drop_preview_rect, decide_exit_action,
         display_terminal_title, effective_drop_target_dimensions, is_localhost_input,
         next_active_after_tab_removal, next_fast_fail_count, normalize_browser_entry_input,
-        normalize_reorder_insert_index, pane_action_tooltip, resolved_link_destination,
-        select_terminal_commands, select_terminal_tab, surface_hint_matches,
-        workspace_autostart_initial_input, workspace_autostart_script, ContentDropZone, ExitAction,
-        TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS, BROWSER_SEARCH_ENTRY_CSS_CLASSES,
-        BROWSER_URL_ENTRY_CSS_CLASS, BROWSER_URL_ENTRY_CSS_CLASSES, FAST_FAIL_WINDOW,
-        HOST_ENTRY_CSS_CLASS, PANE_CSS, RECONNECT_FAST_FAIL_CAP, TAB_RENAME_ENTRY_CSS_CLASS,
+        normalize_reorder_insert_index, pane_action_tooltip, reconnect_delay_ms,
+        resolved_link_destination, select_terminal_commands, select_terminal_tab,
+        surface_hint_matches, workspace_autostart_initial_input, workspace_autostart_script,
+        ContentDropZone, ExitAction, TabDragPayload, BROWSER_SEARCH_ENTRY_CSS_CLASS,
+        BROWSER_SEARCH_ENTRY_CSS_CLASSES, BROWSER_URL_ENTRY_CSS_CLASS,
+        BROWSER_URL_ENTRY_CSS_CLASSES, FAST_FAIL_WINDOW, HOST_ENTRY_CSS_CLASS, PANE_CSS,
+        RECONNECT_FAST_FAIL_CAP, SSH_TRANSPORT_LOSS_CODES, TAB_RENAME_ENTRY_CSS_CLASS,
         TAB_RENAME_ENTRY_CSS_CLASSES,
     };
     #[cfg(feature = "webkit")]
@@ -4955,39 +4977,87 @@ mod tests {
     }
 
     #[test]
-    fn decide_exit_action_reconnects_only_on_a_dirty_ssh_exit() {
-        // Not an auto-reconnect pane (plain shell, or SSH with the flag off):
-        // always remove, whatever the exit code.
-        assert_eq!(decide_exit_action(Some(255), false, 0), ExitAction::Remove);
-        assert_eq!(decide_exit_action(Some(0), false, 0), ExitAction::Remove);
-        assert_eq!(decide_exit_action(None, false, 0), ExitAction::Remove);
+    fn decide_exit_action_reconnects_on_transport_loss_or_startup_race() {
+        let long = Some(Duration::from_secs(10)); // survived the fast-fail window
+        let short = Some(Duration::from_millis(500)); // died during startup
 
-        // Auto-reconnect SSH pane, but a clean exit (user ran `exit`): remove.
-        assert_eq!(decide_exit_action(Some(0), true, 0), ExitAction::Remove);
-        // Auto-reconnect SSH pane, code-less close path: cannot confirm a drop,
-        // so fall through to removal rather than reconnect.
-        assert_eq!(decide_exit_action(None, true, 0), ExitAction::Remove);
-
-        // Auto-reconnect SSH pane, non-zero exit (dropped link): reconnect.
+        // Not an auto-reconnect pane: always remove, whatever the exit code.
         assert_eq!(
-            decide_exit_action(Some(255), true, 0),
+            decide_exit_action(Some(255), false, 0, long),
+            ExitAction::Remove
+        );
+
+        // Clean exit / code-less close: remove regardless of duration.
+        assert_eq!(
+            decide_exit_action(Some(0), true, 0, short),
+            ExitAction::Remove
+        );
+        assert_eq!(decide_exit_action(None, true, 0, short), ExitAction::Remove);
+
+        // Transport-loss codes reconnect even after a long, healthy session — a
+        // genuine dropped link.
+        for code in SSH_TRANSPORT_LOSS_CODES {
+            assert_eq!(
+                decide_exit_action(Some(code), true, 0, long),
+                ExitAction::Reconnect,
+                "code {code}"
+            );
+        }
+
+        // A non-transport non-zero exit AFTER the pane was up is the user's own
+        // result (a remote command that failed): remove, don't relaunch.
+        assert_eq!(
+            decide_exit_action(Some(1), true, 0, long),
+            ExitAction::Remove
+        );
+        assert_eq!(
+            decide_exit_action(Some(127), true, 0, long),
+            ExitAction::Remove
+        );
+        // Unknown duration + non-transport code: treat as a real exit, not a race.
+        assert_eq!(
+            decide_exit_action(Some(1), true, 0, None),
+            ExitAction::Remove
+        );
+
+        // The same codes *during* the startup window are the surface-realization
+        // race (spurious pre-realization exit) and should retry.
+        assert_eq!(
+            decide_exit_action(Some(127), true, 0, short),
             ExitAction::Reconnect
         );
-        assert_eq!(decide_exit_action(Some(1), true, 0), ExitAction::Reconnect);
+        assert_eq!(
+            decide_exit_action(Some(1), true, 0, short),
+            ExitAction::Reconnect
+        );
     }
 
     #[test]
     fn decide_exit_action_gives_up_past_the_fast_fail_cap() {
+        let long = Some(Duration::from_secs(10));
         // At and below the cap we keep reconnecting; only once the count passes
         // the cap do we give up.
         assert_eq!(
-            decide_exit_action(Some(255), true, RECONNECT_FAST_FAIL_CAP),
+            decide_exit_action(Some(255), true, RECONNECT_FAST_FAIL_CAP, long),
             ExitAction::Reconnect
         );
         assert_eq!(
-            decide_exit_action(Some(255), true, RECONNECT_FAST_FAIL_CAP + 1),
+            decide_exit_action(Some(255), true, RECONNECT_FAST_FAIL_CAP + 1, long),
             ExitAction::GiveUp
         );
+    }
+
+    #[test]
+    fn reconnect_delay_ms_caps_the_exponential_backoff() {
+        // 200 ms doubling per fast failure, flat at 3200 ms.
+        assert_eq!(reconnect_delay_ms(0), 200);
+        assert_eq!(reconnect_delay_ms(1), 200);
+        assert_eq!(reconnect_delay_ms(2), 400);
+        assert_eq!(reconnect_delay_ms(3), 800);
+        assert_eq!(reconnect_delay_ms(4), 1600);
+        assert_eq!(reconnect_delay_ms(5), 3200);
+        assert_eq!(reconnect_delay_ms(6), 3200);
+        assert_eq!(reconnect_delay_ms(100), 3200);
     }
 
     #[test]
