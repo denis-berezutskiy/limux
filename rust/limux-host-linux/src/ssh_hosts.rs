@@ -316,7 +316,9 @@ Host prod
         assert!(cmd.contains("'alice@10.0.0.5'"));
         assert!(cmd.contains("-p") && cmd.contains("2222"));
         assert!(cmd.contains("tmux new-session -A -s dev"));
-        assert!(cmd.contains("allow-passthrough on"));
+        // `-gq` (not `-g`): the quiet flag keeps tmux < 3.3, which lacks the
+        // allow-passthrough option, from erroring when the session is created.
+        assert!(cmd.contains("set -gq allow-passthrough on"));
         assert!(cmd.contains("command -v tmux"));
         assert!(cmd.contains("TERM=xterm-256color"));
         assert!(cmd.contains("ServerAliveInterval"));

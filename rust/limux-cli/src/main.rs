@@ -930,13 +930,75 @@ fn in_tmux() -> bool {
         .unwrap_or(false)
 }
 
+/// Validate/normalize a `client_tty` value reported by tmux: trim it and accept
+/// it only if it looks like a device path. Pure, so it's unit-testable without
+/// a running tmux.
+fn parse_client_tty(raw: &str) -> Option<String> {
+    let tty = raw.trim();
+    if tty.starts_with("/dev/") && tty.len() > "/dev/".len() {
+        Some(tty.to_string())
+    } else {
+        None
+    }
+}
+
+/// The tty of the tmux client attached to our session, when we're inside tmux
+/// and a client is attached.
+///
+/// A notification escape written straight to this tty bypasses tmux's own
+/// sequence processing. That is what makes notifications work on tmux < 3.3,
+/// which has no `allow-passthrough`: there, the DCS-passthrough-wrapped escape
+/// written to the *pane's* tty is simply swallowed by tmux and never reaches the
+/// outer terminal. Writing the bare escape to the client tty rides the SSH PTY
+/// straight to the local Ghostty regardless of the remote tmux version.
+///
+/// Returns `None` when not in tmux, tmux can't be run, or no client is attached
+/// (e.g. a detached session) — callers fall back to `/dev/tty`.
+fn tmux_client_tty() -> Option<String> {
+    if !in_tmux() {
+        return None;
+    }
+    let output = std::process::Command::new("tmux")
+        .args(["display-message", "-p", "#{client_tty}"])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_client_tty(&String::from_utf8_lossy(&output.stdout))
+}
+
 /// Emit a notification escape to the controlling terminal.
 ///
-/// Writes to `/dev/tty` (never stdout — agent hooks parse their own stdout as
-/// control JSON, so writing there would corrupt the hook protocol). Best
-/// effort: returns `false` when the tty can't be opened or written.
+/// Inside tmux, prefer writing the *bare* OSC straight to the attached client's
+/// tty ([`tmux_client_tty`]): that bypasses tmux and so works even on tmux < 3.3
+/// (no `allow-passthrough`), where the DCS-wrapped escape would be swallowed.
+/// Otherwise (not in tmux, or no client attached) fall back to `/dev/tty`,
+/// wrapping for tmux passthrough when `$TMUX` is set so a passthrough-capable
+/// tmux still forwards it.
+///
+/// Writes to a tty, never stdout — agent hooks parse their own stdout as control
+/// JSON, so writing there would corrupt the hook protocol. Best effort: returns
+/// `false` when no tty could be opened or written.
 fn emit_notification_escape(title: &str, body: &str) -> bool {
     use std::io::Write;
+
+    if let Some(client_tty) = tmux_client_tty() {
+        let bare = osc_notification(title, body);
+        if let Ok(mut tty) = fs::OpenOptions::new().append(true).open(&client_tty) {
+            if tty
+                .write_all(bare.as_bytes())
+                .and_then(|_| tty.flush())
+                .is_ok()
+            {
+                return true;
+            }
+        }
+        // client tty couldn't be written — fall through to /dev/tty below.
+    }
+
     let sequence = notification_sequence(title, body, in_tmux());
     match fs::OpenOptions::new().append(true).open("/dev/tty") {
         Ok(mut tty) => tty
@@ -1106,6 +1168,37 @@ fn parse_hook_event(args: &[String], payload: &Value) -> String {
         .unwrap_or_else(|| "event".to_string())
 }
 
+/// Normalize an event name to the CamelCase spelling the notification-title
+/// match uses. Accepts both the agent's CamelCase event names (from the hook
+/// payload's `hook_event_name`) and the hyphenated subcommand tokens the hooks
+/// are installed with (`stop`, `session-start`, …). Unknown names pass through.
+fn normalize_hook_event_name(event: &str) -> &str {
+    match event {
+        "notification" => "Notification",
+        "stop" => "Stop",
+        "subagent-stop" => "SubagentStop",
+        "session-start" => "SessionStart",
+        "session-end" => "SessionEnd",
+        "prompt-submit" => "UserPromptSubmit",
+        "pre-tool-use" => "PreToolUse",
+        "post-tool-use" => "PostToolUse",
+        other => other,
+    }
+}
+
+/// The event name to base the human-facing notification title/body on.
+///
+/// Prefers the payload's true `hook_event_name` over the routing token: several
+/// distinct agent events share one subcommand — Claude's `Notification` (waiting
+/// for input) and `Stop` (finished) both route to `stop` — so the routing token
+/// alone can't tell them apart and would mislabel a "waiting for input" alert as
+/// "Claude: stop". Normalized so both the CamelCase payload spelling and the
+/// hyphenated subcommand spelling land on the same title arm.
+fn display_hook_event(routing_event: &str, payload: &Value) -> String {
+    let raw = hook_str(payload, &["hook_event_name", "event"]).unwrap_or(routing_event);
+    normalize_hook_event_name(raw).to_string()
+}
+
 /// Run an agent hook: read JSON from stdin, synthesize a notification.
 ///
 /// Args:
@@ -1129,13 +1222,17 @@ async fn run_agent_hook(
         serde_json::from_str(raw).unwrap_or_else(|_| json!({ "raw": raw }))
     };
 
-    // Explicit --event or positional event beats the JSON field.
+    // Explicit --event or positional event beats the JSON field for routing and
+    // session bookkeeping (the subcommand the hook was installed with).
     let event = parse_hook_event(args, &payload);
 
-    // Build a human-friendly title + body depending on event + agent.
+    // Build a human-friendly title + body. Use the *display* event, which prefers
+    // the payload's true `hook_event_name`, so a Notification routed through the
+    // `stop` subcommand still reads as "needs you", not "Claude: stop".
     let agent_label = agent.label();
     persist_agent_hook_session(agent, args, &payload, &event)?;
-    let (title, body) = match event.as_str() {
+    let display_event = display_hook_event(&event, &payload);
+    let (title, body) = match display_event.as_str() {
         "Notification" => (
             format!("{agent_label} needs you"),
             hook_str(&payload, &["message", "notification"])
@@ -4073,6 +4170,40 @@ mod cli_arg_tests {
     }
 
     #[test]
+    fn normalize_hook_event_name_maps_subcommand_tokens_to_camelcase() {
+        assert_eq!(normalize_hook_event_name("stop"), "Stop");
+        assert_eq!(normalize_hook_event_name("notification"), "Notification");
+        assert_eq!(normalize_hook_event_name("session-start"), "SessionStart");
+        assert_eq!(
+            normalize_hook_event_name("prompt-submit"),
+            "UserPromptSubmit"
+        );
+        // CamelCase (payload) spellings pass through unchanged.
+        assert_eq!(normalize_hook_event_name("Notification"), "Notification");
+        assert_eq!(normalize_hook_event_name("Stop"), "Stop");
+    }
+
+    #[test]
+    fn display_hook_event_prefers_payload_event_over_routing_token() {
+        // The bug: Claude's Notification event routes through the `stop`
+        // subcommand, so the routing token is "stop" — but the payload carries
+        // the true event. The title must read as a notification, not a stop.
+        let payload = json!({ "hook_event_name": "Notification" });
+        assert_eq!(display_hook_event("stop", &payload), "Notification");
+
+        // A real Stop event: payload agrees, still "Stop".
+        let payload = json!({ "hook_event_name": "Stop" });
+        assert_eq!(display_hook_event("stop", &payload), "Stop");
+
+        // No payload event → fall back to the routing token, normalized.
+        assert_eq!(display_hook_event("stop", &json!({})), "Stop");
+        assert_eq!(
+            display_hook_event("session-start", &json!({})),
+            "SessionStart"
+        );
+    }
+
+    #[test]
     fn external_session_end_preserves_restorable_hook_session() {
         assert_eq!(
             agent_hook_persistence_action("SessionEnd"),
@@ -4572,6 +4703,24 @@ mod notify_escape_tests {
         let seq = notification_sequence("t", "b", true);
         assert!(seq.starts_with("\x1bPtmux;"));
         assert!(seq.ends_with("\x1b\\"));
+    }
+
+    #[test]
+    fn parse_client_tty_accepts_device_paths_and_rejects_junk() {
+        // tmux prints the client tty followed by a trailing newline.
+        assert_eq!(
+            parse_client_tty("/dev/pts/10\n").as_deref(),
+            Some("/dev/pts/10")
+        );
+        assert_eq!(
+            parse_client_tty("  /dev/tty1  ").as_deref(),
+            Some("/dev/tty1")
+        );
+        // No client attached / not a device path -> None (caller uses /dev/tty).
+        assert_eq!(parse_client_tty(""), None);
+        assert_eq!(parse_client_tty("\n"), None);
+        assert_eq!(parse_client_tty("/dev/"), None);
+        assert_eq!(parse_client_tty("not-a-tty"), None);
     }
 
     #[test]

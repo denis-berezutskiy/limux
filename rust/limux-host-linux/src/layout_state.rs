@@ -282,11 +282,13 @@ impl SshConnection {
             //     terminal: xterm-ghostty" (ssh forwards the local TERM);
             //   * attaches or creates the tmux session (persistence across drops);
             //   * enables allow-passthrough so OSC notifications emitted by a remote
-            //     agent survive tmux and reach the local terminal;
+            //     agent survive tmux and reach the local terminal — the `-q` keeps
+            //     tmux < 3.3 (which lacks the option, e.g. 3.2a) from erroring on
+            //     it; on those the CLI's client-tty bypass delivers notifications;
             //   * if the remote has no tmux, execs a login shell instead of failing
             //     (a failure would otherwise trigger an auto-reconnect storm).
             let remote = format!(
-                "infocmp xterm-ghostty >/dev/null 2>&1 || export TERM=xterm-256color; command -v tmux >/dev/null 2>&1 && exec tmux new-session -A -s {session} \\; set -g allow-passthrough on || exec \"${{SHELL:-/bin/sh}}\" -l"
+                "infocmp xterm-ghostty >/dev/null 2>&1 || export TERM=xterm-256color; command -v tmux >/dev/null 2>&1 && exec tmux new-session -A -s {session} \\; set -gq allow-passthrough on || exec \"${{SHELL:-/bin/sh}}\" -l"
             );
             command.push(' ');
             command.push_str(&shell_single_quote(&remote));
