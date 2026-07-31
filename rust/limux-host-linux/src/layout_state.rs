@@ -372,6 +372,22 @@ impl SshConnection {
             .collect::<Vec<_>>()
             .join(" ")
     }
+
+    /// True when connecting to `other` would land in the same place as `self`:
+    /// same remote destination *and* same tmux session. Compares the
+    /// destination-identifying fields (host, user, port, identity, proxy jump)
+    /// plus the remote session name, but ignores the `persist_tmux` /
+    /// `auto_reconnect` toggles — those change *how* the pane behaves, not
+    /// *where* it lands. Used to avoid opening a second workspace (which would
+    /// attach to the first's tmux session) when a host already has one.
+    pub fn same_target(&self, other: &SshConnection) -> bool {
+        self.host == other.host
+            && self.user == other.user
+            && self.port == other.port
+            && self.identity_file == other.identity_file
+            && self.proxy_jump == other.proxy_jump
+            && self.remote_session_name == other.remote_session_name
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
@@ -392,6 +408,24 @@ pub enum TabContentState {
     },
     Keybinds {},
     Settings {},
+}
+
+/// Find the first terminal tab's SSH connection anywhere in a layout tree
+/// (depth-first, start-before-end for splits). Returns `None` for a layout with
+/// no SSH terminal. Used to identify which remote a workspace targets so a
+/// repeat click on an SSH host reuses its workspace instead of duplicating it.
+pub fn first_ssh_connection(layout: &LayoutNodeState) -> Option<&SshConnection> {
+    match layout {
+        LayoutNodeState::Pane(pane) => pane.tabs.iter().find_map(|tab| match &tab.content {
+            TabContentState::Terminal {
+                ssh: Some(conn), ..
+            } => Some(conn.as_ref()),
+            _ => None,
+        }),
+        LayoutNodeState::Split(split) => {
+            first_ssh_connection(&split.start).or_else(|| first_ssh_connection(&split.end))
+        }
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -990,10 +1024,12 @@ fn wrap_restored_agent_command(
     format!("{run_command}; limux_agent_status=$?; {cleanup}; exec \"${{SHELL:-/bin/sh}}\" -l")
 }
 
-/// Resolve the local `limux` CLI path: the sibling `limux-cli` next to the
-/// running executable (dev build), else the installed `bin/limux`, else the
-/// bare name `limux` from `PATH`. Reused by remote provisioning to know which
-/// local binary to upload to a host.
+/// Resolve the local `limux` CLI path for running *on this machine* (e.g. an
+/// agent-cleanup hook): the sibling `limux-cli` next to the running executable
+/// (dev build), else the installed `bin/limux`, else the bare name `limux` from
+/// `PATH`. For the binary to upload to a *remote* host, use
+/// [`remote_helper_cli`] instead — it prefers a static build that runs
+/// regardless of the remote's glibc version.
 pub fn limux_cli_executable() -> String {
     std::env::current_exe()
         .ok()
@@ -1021,6 +1057,81 @@ fn limux_cli_candidates(exe: &Path) -> Vec<PathBuf> {
 
     candidates.push(PathBuf::from("limux"));
     candidates
+}
+
+/// A local limux CLI binary that can be uploaded to a remote SSH host, plus
+/// whether it is statically linked. A static (musl) build has no glibc
+/// dependency, so it runs on any x86_64 Linux regardless of the remote's glibc
+/// version — the dynamically-linked local build fails to even start with
+/// `/lib64/libc.so.6: version 'GLIBC_x.y' not found` on hosts whose glibc
+/// predates this build machine's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteHelperCli {
+    pub path: String,
+    pub is_static: bool,
+}
+
+/// Ordered candidate helper binaries to upload to an **x86_64 Linux** remote,
+/// statically-linked builds first so glibc version never matters. Pure (takes
+/// the running-exe path) so the ordering is unit-testable; [`remote_helper_cli`]
+/// picks the first that actually exists on disk.
+///
+/// musl is libc-independent, not CPU-independent — these are x86_64 binaries, so
+/// the caller must confirm the remote is x86_64 Linux before uploading one.
+fn remote_helper_candidates(exe: &Path) -> Vec<RemoteHelperCli> {
+    let mut candidates = Vec::new();
+    let mut push_static = |path: PathBuf| {
+        candidates.push(RemoteHelperCli {
+            path: path.to_string_lossy().into_owned(),
+            is_static: true,
+        })
+    };
+
+    if let Some(dir) = exe.parent() {
+        // Dev build: `cargo build -p limux-cli --target x86_64-unknown-linux-musl`
+        // lands under `target/<triple>/<profile>/limux-cli`. `dir` is
+        // `target/<profile>/` (next to the running GUI binary), so its parent is
+        // the cargo target dir.
+        if let Some(target_dir) = dir.parent() {
+            let musl = target_dir.join("x86_64-unknown-linux-musl");
+            push_static(musl.join("release").join("limux-cli"));
+            push_static(musl.join("debug").join("limux-cli"));
+        }
+        // Packaged: a static helper shipped next to the launcher.
+        push_static(dir.join("limux-cli-static"));
+        // Installed layout: `<prefix>/libexec/limux/limux-host` → shared data.
+        if let Some(libexec_dir) = dir.parent() {
+            if let Some(prefix) = libexec_dir.parent() {
+                push_static(
+                    prefix
+                        .join("share")
+                        .join("limux")
+                        .join("limux-remote-x86_64"),
+                );
+            }
+        }
+    }
+
+    // Fall back to the dynamically-linked local binary. It works only when the
+    // remote's glibc is at least as new as this build machine's; provisioning
+    // verifies it actually runs on the remote before relying on it.
+    for path in limux_cli_candidates(exe) {
+        candidates.push(RemoteHelperCli {
+            path: path.to_string_lossy().into_owned(),
+            is_static: false,
+        });
+    }
+    candidates
+}
+
+/// Resolve the best limux CLI to upload to an x86_64 Linux remote: a static
+/// (musl) build if one is present, else the dynamically-linked local binary.
+/// Returns `None` when no real file is found on disk (nothing to upload).
+pub fn remote_helper_cli() -> Option<RemoteHelperCli> {
+    let exe = std::env::current_exe().ok()?;
+    remote_helper_candidates(&exe)
+        .into_iter()
+        .find(|candidate| Path::new(&candidate.path).exists())
 }
 
 fn sanitize_launch_arguments(kind: RestorableAgentKind, arguments: &[String]) -> Vec<String> {
@@ -1334,6 +1445,81 @@ mod tests {
         let candidates = limux_cli_candidates(dev);
         assert!(candidates.contains(&PathBuf::from("/repo/target/debug/limux-cli")));
         assert!(candidates.contains(&PathBuf::from("limux")));
+    }
+
+    #[test]
+    fn remote_helper_candidates_prefer_static_then_fall_back_to_dynamic() {
+        let dev = Path::new("/repo/target/debug/limux");
+        let candidates = remote_helper_candidates(dev);
+
+        // Every static candidate must be ordered before any dynamic one, so a
+        // musl build (when present) always wins over the glibc local binary.
+        let first_dynamic = candidates.iter().position(|c| !c.is_static);
+        let last_static = candidates.iter().rposition(|c| c.is_static);
+        if let (Some(first_dynamic), Some(last_static)) = (first_dynamic, last_static) {
+            assert!(last_static < first_dynamic, "static must precede dynamic");
+        }
+
+        // The dev musl release build is the top preference.
+        assert_eq!(
+            candidates.first(),
+            Some(&RemoteHelperCli {
+                path: "/repo/target/x86_64-unknown-linux-musl/release/limux-cli".to_string(),
+                is_static: true,
+            })
+        );
+        // The dynamically-linked sibling is still offered as a fallback.
+        assert!(candidates.contains(&RemoteHelperCli {
+            path: "/repo/target/debug/limux-cli".to_string(),
+            is_static: false,
+        }));
+
+        // Installed layout exposes the shipped static helper under share/.
+        let installed = Path::new("/usr/libexec/limux/limux-host");
+        let candidates = remote_helper_candidates(installed);
+        assert!(candidates.contains(&RemoteHelperCli {
+            path: "/usr/share/limux/limux-remote-x86_64".to_string(),
+            is_static: true,
+        }));
+    }
+
+    #[test]
+    fn same_target_ignores_persist_and_reconnect_but_honors_destination_and_session() {
+        let mut a = ssh_conn("h", Some("u"), Some(22), None, None);
+        a.remote_session_name = Some("dev".to_string());
+        let mut b = a.clone();
+        // Toggling the behavior flags must not change identity.
+        b.persist_tmux = !a.persist_tmux;
+        b.auto_reconnect = !a.auto_reconnect;
+        assert!(a.same_target(&b));
+
+        // A different session name (e.g. a different alias) is a different target.
+        let mut c = a.clone();
+        c.remote_session_name = Some("prod".to_string());
+        assert!(!a.same_target(&c));
+
+        // A different destination is a different target.
+        let mut d = a.clone();
+        d.host = "other".to_string();
+        assert!(!a.same_target(&d));
+    }
+
+    #[test]
+    fn first_ssh_connection_finds_terminal_in_split_and_ignores_plain_terminals() {
+        let conn = ssh_conn("box", Some("me"), None, None, None);
+        let layout = LayoutNodeState::Split(SplitState {
+            orientation: SplitOrientation::Horizontal,
+            ratio: 0.5,
+            // A plain (non-SSH) terminal on the left...
+            start: Box::new(LayoutNodeState::Pane(PaneState::fallback(Some("/x")))),
+            // ...and the SSH pane on the right must still be found.
+            end: Box::new(LayoutNodeState::Pane(PaneState::ssh(None, conn.clone()))),
+        });
+        assert_eq!(first_ssh_connection(&layout), Some(&conn));
+
+        // A layout with no SSH terminal returns None.
+        let plain = LayoutNodeState::Pane(PaneState::fallback(Some("/x")));
+        assert_eq!(first_ssh_connection(&plain), None);
     }
 
     #[test]

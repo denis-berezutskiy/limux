@@ -62,6 +62,11 @@ struct Workspace {
     autostart_command: Rc<RefCell<Option<String>>>,
     /// Path label shown below workspace name in sidebar.
     path_label: gtk::Label,
+    /// The SSH target this workspace was opened for, if any (the first SSH
+    /// terminal in its initial layout). Lets a repeat click on an SSH host
+    /// switch to the existing workspace instead of opening a duplicate that
+    /// would attach to the same remote tmux session.
+    ssh_connection: Option<layout_state::SshConnection>,
 }
 
 pub(crate) struct AppState {
@@ -3952,6 +3957,9 @@ fn create_workspace_for_tab(state: &State, payload: &str) -> bool {
             folder_path: seed.folder_path.clone(),
             autostart_command,
             path_label,
+            // A workspace created by detaching a tab isn't opened *for* an SSH
+            // host, so it takes part in host-click dedup only as a fresh target.
+            ssh_connection: None,
         });
         app_state.active_idx = app_state.workspaces.len() - 1;
         app_state.stack.set_visible_child_name(&stack_name);
@@ -4569,8 +4577,35 @@ fn delete_ssh_host(state: &State, idx: usize) {
     refresh_ssh_hosts(state);
 }
 
-/// Open a new workspace whose single pane execs the host's ssh command.
+/// Index of an existing workspace already targeting `conn` (same remote host and
+/// tmux session), if any. Used so a repeat click on an SSH host reuses its
+/// workspace instead of duplicating it.
+fn existing_ssh_workspace_index(
+    state: &State,
+    conn: &layout_state::SshConnection,
+) -> Option<usize> {
+    state.borrow().workspaces.iter().position(|ws| {
+        ws.ssh_connection
+            .as_ref()
+            .is_some_and(|existing| existing.same_target(conn))
+    })
+}
+
+/// Connect to an SSH host from the sidebar: switch to its existing workspace if
+/// one is already open, otherwise open a new workspace whose single pane execs
+/// the host's ssh command.
 fn connect_ssh_host(state: &State, host: &crate::ssh_hosts::SshHost) {
+    let conn = host.to_connection();
+
+    // Reuse an existing workspace for this host rather than opening a duplicate.
+    // A second workspace would run `tmux new-session -A -s <alias>` and *attach*
+    // to the first's session — silently mirroring its panes — which is confusing.
+    if let Some(idx) = existing_ssh_workspace_index(state, &conn) {
+        activate_workspace_shortcut(state, idx);
+        request_session_save(state);
+        return;
+    }
+
     let workspace = WorkspaceState {
         id: None,
         name: host.alias.clone(),
@@ -4578,13 +4613,13 @@ fn connect_ssh_host(state: &State, host: &crate::ssh_hosts::SshHost) {
         cwd: None,
         folder_path: None,
         autostart_command: None,
-        layout: LayoutNodeState::Pane(PaneState::ssh(None, host.to_connection())),
+        layout: LayoutNodeState::Pane(PaneState::ssh(None, conn.clone())),
     };
     add_workspace_from_state(state, &workspace);
     // Opt-in: push the limux CLI + agent hooks to the remote so its coding
     // agents' notifications reach this machine. Best-effort and off the GTK loop.
     if host.provision_notifications {
-        provision_remote_notifications(host.to_connection(), layout_state::limux_cli_executable());
+        provision_remote_notifications(conn);
     }
     request_session_save(state);
 }
@@ -4592,22 +4627,34 @@ fn connect_ssh_host(state: &State, host: &crate::ssh_hosts::SshHost) {
 /// Provision agent-hook notifications on a freshly-connected SSH host so a
 /// remote coding agent's OSC notifications reach this machine automatically.
 /// Best-effort and entirely off the GTK main loop: the whole sequence (arch
-/// probe, `mkdir`, `scp` of the local CLI, `chmod` + `limux hooks setup`) runs
-/// on a `gio::spawn_blocking` worker thread. Nothing here touches GTK widgets,
-/// so the work needs no hop back to the main thread; the outer `spawn_local`
-/// only drives the blocking future, mirroring `pane::resolve_pasted_image_for_tab`.
-fn provision_remote_notifications(conn: layout_state::SshConnection, local_cli: String) {
+/// probe, helper resolution, `mkdir`, `scp`, `chmod`, a run-check, then
+/// `limux hooks setup`) runs on a `gio::spawn_blocking` worker thread. Nothing
+/// here touches GTK widgets, so the work needs no hop back to the main thread;
+/// the outer `spawn_local` only drives the blocking future, mirroring
+/// `pane::resolve_pasted_image_for_tab`.
+fn provision_remote_notifications(conn: layout_state::SshConnection) {
     glib::MainContext::default().spawn_local(async move {
-        let _ =
-            gio::spawn_blocking(move || provision_remote_notifications_blocking(&conn, &local_cli))
-                .await;
+        let _ = gio::spawn_blocking(move || provision_remote_notifications_blocking(&conn)).await;
     });
 }
 
-/// Remote command that finalizes provisioning: make the uploaded CLI executable
-/// and run `hooks setup`, pinning `LIMUX_HOOK_CLI` to the binary's *absolute*
-/// path (resolved from `$HOME` by the remote shell) so every generated agent
-/// hook invokes limux by that path rather than depending on the remote's PATH.
+/// Remote command that makes the uploaded CLI executable. Split from the hooks
+/// setup so a run-check can sit between them: we want to confirm the binary
+/// actually *executes* on the remote before wiring the agent hooks to it.
+const REMOTE_CHMOD_COMMAND: &str = "chmod +x ~/.local/bin/limux";
+
+/// Remote command that confirms the uploaded CLI can actually run on the host.
+/// `--help` exits 0 on success; if the binary can't start — e.g. a dynamically
+/// linked build against a newer glibc than the remote's, which fails with
+/// `/lib64/libc.so.6: version 'GLIBC_x.y' not found` — this exits non-zero and
+/// provisioning reports an actionable error instead of silently installing
+/// hooks that would never fire. Output is discarded; only the exit code matters.
+const REMOTE_VERIFY_COMMAND: &str = "~/.local/bin/limux --help >/dev/null 2>&1";
+
+/// Remote command that runs `hooks setup`, pinning `LIMUX_HOOK_CLI` to the
+/// binary's *absolute* path (resolved from `$HOME` by the remote shell) so every
+/// generated agent hook invokes limux by that path rather than depending on the
+/// remote's PATH.
 ///
 /// This is the crux of the feature working end-to-end: a coding agent runs its
 /// hooks in a non-login / non-interactive shell whose PATH usually does *not*
@@ -4617,18 +4664,21 @@ fn provision_remote_notifications(conn: layout_state::SshConnection, local_cli: 
 /// shell — not the local one — expands `~` and `$HOME`; `$HOME` stays in double
 /// quotes so a home directory containing spaces still resolves correctly.
 const REMOTE_HOOKS_SETUP_COMMAND: &str =
-    "chmod +x ~/.local/bin/limux && LIMUX_HOOK_CLI=\"$HOME/.local/bin/limux\" ~/.local/bin/limux hooks setup";
+    "LIMUX_HOOK_CLI=\"$HOME/.local/bin/limux\" ~/.local/bin/limux hooks setup";
 
 /// The blocking body of [`provision_remote_notifications`], run on a
 /// `gio::spawn_blocking` worker thread. Detects the remote arch first and bails
-/// (with a log line) unless it matches the local x86_64 Linux binary, then
-/// uploads the CLI and runs `hooks setup`. Every step logs its own outcome;
+/// (with a log line) unless it is x86_64 Linux, resolves the best local helper
+/// binary (a static musl build if available — see
+/// [`layout_state::remote_helper_cli`]), uploads it, *verifies it runs on the
+/// remote*, then runs `hooks setup`. Every step logs its own outcome;
 /// provisioning is strictly best-effort and never panics or blocks the UI.
-fn provision_remote_notifications_blocking(conn: &layout_state::SshConnection, local_cli: &str) {
+fn provision_remote_notifications_blocking(conn: &layout_state::SshConnection) {
     let host = conn.host.as_str();
 
-    // a. Detect the remote arch. The local binary is x86_64 Linux, so anything
-    //    else can't run there — skip rather than upload an unusable binary.
+    // a. Detect the remote arch. Our helper binaries are x86_64 (a static musl
+    //    build is glibc-independent but *not* CPU-independent), so anything else
+    //    can't run there — skip rather than upload an unusable binary.
     let arch = match run_provision_capture(&conn.ssh_command("uname -s -m")) {
         Some(arch) => arch,
         None => {
@@ -4637,26 +4687,72 @@ fn provision_remote_notifications_blocking(conn: &layout_state::SshConnection, l
         }
     };
     if arch != "Linux x86_64" {
-        eprintln!("limux: remote provisioning skipped (arch {arch}; local binary is x86_64 linux)");
+        eprintln!(
+            "limux: remote provisioning skipped (arch {arch}; only x86_64 Linux remotes are supported)"
+        );
         return;
     }
 
-    // b. Upload the CLI to ~/.local/bin/limux, then chmod + run `hooks setup`
-    //    with LIMUX_HOOK_CLI pinned to the absolute path (see the const's docs).
-    //    `~` is expanded by the remote shell; scp uses `-o ProxyJump` (no -J).
-    let steps = [
+    // b. Pick the best helper to upload: a static (musl) build runs on any glibc
+    //    version; fall back to the dynamically linked local binary otherwise.
+    let helper = match layout_state::remote_helper_cli() {
+        Some(helper) => helper,
+        None => {
+            eprintln!("limux: remote provisioning skipped (no local limux CLI found to upload)");
+            return;
+        }
+    };
+
+    // c. Upload to ~/.local/bin/limux and make it executable. `~` is expanded by
+    //    the remote shell; scp uses `-o ProxyJump` (no -J).
+    let upload = [
         conn.ssh_command("mkdir -p ~/.local/bin"),
-        conn.scp_command(local_cli, "~/.local/bin/limux"),
-        conn.ssh_command(REMOTE_HOOKS_SETUP_COMMAND),
+        conn.scp_command(&helper.path, "~/.local/bin/limux"),
+        conn.ssh_command(REMOTE_CHMOD_COMMAND),
     ];
-    for step in steps {
-        // c. Each step runs via `sh -c`; a non-zero exit aborts the rest.
+    for step in upload {
+        // Each step runs via `sh -c`; a non-zero exit aborts the rest.
         if !run_provision_step(&step) {
-            eprintln!("limux: remote provisioning of agent notifications on {host} failed");
+            eprintln!(
+                "limux: remote provisioning of agent notifications on {host} failed (upload)"
+            );
             return;
         }
     }
-    eprintln!("limux: provisioned remote agent notifications on {host}");
+
+    // d. Confirm the uploaded binary actually executes before wiring hooks to
+    //    it. A dynamically linked helper fails here on hosts whose glibc is
+    //    older than this build machine's; a static musl helper avoids that.
+    if !run_provision_step(&conn.ssh_command(REMOTE_VERIFY_COMMAND)) {
+        if helper.is_static {
+            eprintln!(
+                "limux: remote provisioning failed: the uploaded static helper did not run on {host}"
+            );
+        } else {
+            eprintln!(
+                "limux: remote provisioning failed on {host}: the uploaded limux binary can't start \
+                 there (most likely the remote's glibc is older than this machine's). Build the \
+                 glibc-independent helper with `scripts/build-remote-helper.sh`, then reconnect — \
+                 provisioning will upload that static binary automatically."
+            );
+        }
+        return;
+    }
+
+    // e. Wire up the agent hooks now that we know the binary works.
+    if !run_provision_step(&conn.ssh_command(REMOTE_HOOKS_SETUP_COMMAND)) {
+        eprintln!(
+            "limux: remote provisioning of agent notifications on {host} failed (hooks setup)"
+        );
+        return;
+    }
+
+    let kind = if helper.is_static {
+        "static"
+    } else {
+        "dynamic"
+    };
+    eprintln!("limux: provisioned remote agent notifications on {host} ({kind} helper)");
 }
 
 /// Run a shell-quoted command (from the ssh/scp builders) to completion,
@@ -5631,6 +5727,7 @@ fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
     install_workspace_row_interactions(state, &id, &row, &favorite_button);
 
     let cwd: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(workspace.cwd.clone()));
+    let ssh_connection = layout_state::first_ssh_connection(&workspace.layout).cloned();
     let ws = Workspace {
         id,
         name: workspace.name.clone(),
@@ -5647,6 +5744,7 @@ fn add_workspace_from_state(state: &State, workspace: &WorkspaceState) {
         folder_path: workspace.folder_path.clone(),
         autostart_command,
         path_label,
+        ssh_connection,
     };
 
     if workspace.favorite {
@@ -7304,7 +7402,8 @@ mod tests {
         NeighborScore, PaneBounds, PaneCreateDirection, PaneCreateTargetError,
         PortalColorSchemePreference, SessionSaveAccess, SessionSaveRequest, SshHostForm,
         WorkspaceSeedSource, BASE_CSS, HOST_ENTRY_CSS_CLASS, REMOTE_HOOKS_SETUP_COMMAND,
-        WORKSPACE_RENAME_ENTRY_CSS_CLASS, WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
+        REMOTE_VERIFY_COMMAND, WORKSPACE_RENAME_ENTRY_CSS_CLASS,
+        WORKSPACE_RENAME_ENTRY_CSS_CLASSES,
     };
     use crate::layout_state::{LayoutNodeState, PaneState, SplitOrientation, SplitState};
     use crate::shortcut_config::{
@@ -7372,6 +7471,12 @@ mod tests {
             REMOTE_HOOKS_SETUP_COMMAND.contains("~/.local/bin/limux hooks setup"),
             "cmd={REMOTE_HOOKS_SETUP_COMMAND}"
         );
+        // chmod is now its own step (a run-check sits between it and hooks setup),
+        // so the hooks command must no longer carry the chmod itself.
+        assert!(
+            !REMOTE_HOOKS_SETUP_COMMAND.contains("chmod"),
+            "cmd={REMOTE_HOOKS_SETUP_COMMAND}"
+        );
 
         // Wrapped by ssh_command the whole thing is one single-quoted argument, so
         // the *remote* shell (not the local `sh -c`) expands `$HOME` and `~`.
@@ -7379,10 +7484,19 @@ mod tests {
         let cmd = conn.ssh_command(REMOTE_HOOKS_SETUP_COMMAND);
         assert!(
             cmd.contains(
-                "'chmod +x ~/.local/bin/limux && LIMUX_HOOK_CLI=\"$HOME/.local/bin/limux\" ~/.local/bin/limux hooks setup'"
+                "'LIMUX_HOOK_CLI=\"$HOME/.local/bin/limux\" ~/.local/bin/limux hooks setup'"
             ),
             "cmd={cmd}"
         );
+    }
+
+    #[test]
+    fn remote_verify_command_runs_uploaded_binary_and_ignores_output() {
+        // The run-check must invoke the *uploaded* binary (absolute path) and
+        // succeed only when it actually executes — output is irrelevant, exit
+        // code is everything (a glibc-mismatch failure exits non-zero).
+        assert!(REMOTE_VERIFY_COMMAND.contains("~/.local/bin/limux"));
+        assert!(REMOTE_VERIFY_COMMAND.contains(">/dev/null 2>&1"));
     }
 
     #[test]

@@ -308,6 +308,31 @@ assert_glibc_compatibility "$CLI_BINARY" "limux CLI"
 assert_glibc_compatibility "$HOST_BINARY" "limux host"
 assert_cli_entrypoint "$CLI_BINARY" "target/release/limux-cli"
 
+# Glibc-independent remote helper (best-effort). A statically linked musl build
+# of the CLI that Limux uploads to remote SSH hosts for agent notifications; it
+# runs regardless of the remote's glibc version (the dynamically linked CLI
+# fails to start on hosts with an older glibc). Optional: if the musl target or
+# toolchain isn't available, packaging continues without it and the app falls
+# back to uploading the dynamically linked CLI at runtime. Never glibc-checked —
+# being glibc-free is the whole point.
+REMOTE_HELPER_TARGET="x86_64-unknown-linux-musl"
+REMOTE_HELPER_BINARY=""
+echo "Building glibc-independent remote helper (${REMOTE_HELPER_TARGET})..."
+if rustup target add "$REMOTE_HELPER_TARGET" >/dev/null 2>&1 \
+    && cargo build -p limux-cli --release --target "$REMOTE_HELPER_TARGET" \
+        --manifest-path "${ROOT_DIR}/Cargo.toml"; then
+    candidate="${ROOT_DIR}/target/${REMOTE_HELPER_TARGET}/release/limux-cli"
+    if [ -f "$candidate" ]; then
+        REMOTE_HELPER_BINARY="$candidate"
+        echo "  remote helper: $REMOTE_HELPER_BINARY"
+    fi
+fi
+if [ -z "$REMOTE_HELPER_BINARY" ]; then
+    echo "  WARNING: remote helper not built; remote agent-notification provisioning"
+    echo "           falls back to the dynamically linked CLI (may fail on hosts with"
+    echo "           an older glibc). Add the ${REMOTE_HELPER_TARGET} rust target to enable it."
+fi
+
 # Clean staging and output
 remove_tree "$STAGE"
 remove_tree "$OUT_DIR"
@@ -342,6 +367,14 @@ populate_tree() {
     chmod 755 "$bindir/$CLI_ENTRYPOINT_NAME" "$libexecdir/$HOST_ENTRYPOINT_NAME"
     assert_cli_entrypoint "$bindir/$CLI_ENTRYPOINT_NAME" "packaged $prefix/bin/$CLI_ENTRYPOINT_NAME"
     assert_no_legacy_host_entrypoint "$libexecdir/limux" "packaged $prefix libexec tree"
+
+    # Glibc-independent remote helper (optional; see the build step above). Kept
+    # under share/limux so layout_state::remote_helper_cli finds it at runtime
+    # and prefers it when provisioning agent notifications on an SSH host.
+    if [ -n "$REMOTE_HELPER_BINARY" ] && [ -f "$REMOTE_HELPER_BINARY" ]; then
+        cp "$REMOTE_HELPER_BINARY" "$ghostty_datadir/limux-remote-x86_64"
+        chmod 755 "$ghostty_datadir/limux-remote-x86_64"
+    fi
 
     # Shared library
     cp "$GHOSTTY_SO" "$libdir/$GHOSTTY_LIBRARY_NAME"
