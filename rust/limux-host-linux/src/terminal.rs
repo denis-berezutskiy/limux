@@ -10,7 +10,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::os::unix::ffi::OsStringExt;
 use std::ptr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -1276,11 +1276,6 @@ fn clipboard_formats_include_text<'a>(
     })
 }
 
-/// Serial counter so two image pastes in the same nanosecond still get distinct
-/// temp files; combined with the pid and wall-clock nanos in the file name it
-/// is unique across processes and calls.
-static PASTED_IMAGE_SERIAL: AtomicU64 = AtomicU64::new(0);
-
 /// True when this key event is a clipboard-paste chord (Ctrl+V or Ctrl+Shift+V)
 /// that Limux should inspect for image content before ghostty treats it as a
 /// text paste. Alt/Super disqualify it so unrelated chords fall through.
@@ -1336,25 +1331,18 @@ fn try_begin_image_paste(
     true
 }
 
-/// A unique `limux-paste-<token>.png` name. The token only ever contains digits
-/// and hyphens, so the bare name never needs shell-quoting on its own.
-fn pasted_image_file_name() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let serial = PASTED_IMAGE_SERIAL.fetch_add(1, Ordering::Relaxed);
-    format!("limux-paste-{}-{nanos}-{serial}.png", std::process::id())
-}
-
-/// Write the pasted PNG to a uniquely named temp file and return its path.
+/// Write the pasted PNG to a uniquely named temp file and return its path, using
+/// the shared [`crate::layout_state::paste_file_name`] so the local temp name and
+/// the remote upload name never drift.
 ///
-/// The file is intentionally NOT deleted here: the resolver (and, for SSH
-/// panes, the background scp) still needs to read it after this returns, and an
-/// agent reading the injected path expects the file to persist. (cmux
-/// historically unlinked these too early, breaking the paste it shipped.)
+/// The file is intentionally NOT deleted here: the resolver still needs it after
+/// this returns — a local pane injects this path and the agent reads it later; an
+/// SSH pane uploads it via scp. The SSH path removes the local copy once the
+/// upload succeeds (`pane::resolve_pasted_image_for_tab`); a local pane keeps it,
+/// matching cmux, which reaps its local temp images at app exit rather than per
+/// paste.
 fn write_pasted_image_png(bytes: &[u8]) -> Option<std::path::PathBuf> {
-    let path = std::env::temp_dir().join(pasted_image_file_name());
+    let path = std::env::temp_dir().join(crate::layout_state::paste_file_name());
     match std::fs::write(&path, bytes) {
         Ok(()) => Some(path),
         Err(err) => {
@@ -3404,15 +3392,6 @@ mod tests {
         // A path with a space is quoted AND still gets the trailing separator.
         let escaped = shell_escape_path_with_trailing_space(b"/tmp/my paste.png").unwrap();
         assert_eq!(escaped.to_bytes(), b"$'/tmp/my paste.png' ");
-    }
-
-    #[test]
-    fn pasted_image_file_name_is_unique_png() {
-        let a = pasted_image_file_name();
-        let b = pasted_image_file_name();
-        assert!(a.starts_with("limux-paste-"), "got {a}");
-        assert!(a.ends_with(".png"), "got {a}");
-        assert_ne!(a, b, "serial counter must make names unique");
     }
 
     #[test]

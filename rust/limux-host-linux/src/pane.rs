@@ -1481,7 +1481,14 @@ fn resolve_pasted_image_for_tab(
     let remote_path = conn.remote_paste_path();
     let scp = conn.scp_command(&local_path, &remote_path);
     glib::MainContext::default().spawn_local(async move {
-        match gtk::gio::spawn_blocking(move || run_scp_command(&scp)).await {
+        let uploaded = gtk::gio::spawn_blocking(move || run_scp_command(&scp)).await;
+        // The local temp PNG was only staging for the upload; the injected path
+        // is the *remote* copy, so the local file has no further use on this SSH
+        // path — remove it regardless of outcome. (A local pane keeps its temp
+        // file: it injects that path and the agent reads it there. This matches
+        // cmux, which reaps the local upload copy after a successful transfer.)
+        let _ = std::fs::remove_file(&local_png);
+        match uploaded {
             Ok(true) => inject(remote_path),
             Ok(false) => {
                 eprintln!("limux: image paste: scp to {remote_path} failed; not injecting a path");

@@ -301,10 +301,11 @@ impl SshConnection {
     }
 
     /// A unique remote path to upload a pasted image to before injecting it
-    /// into the remote shell. After the fixed prefix it is composed only of
-    /// digits and hyphens, so it is inherently shell-safe (nothing to sanitize).
+    /// into the remote shell. Built from the shared [`paste_file_name`] so the
+    /// remote and local temp names use one scheme; the whole name is only digits
+    /// and hyphens after the fixed prefix, so it is inherently shell-safe.
     pub fn remote_paste_path(&self) -> String {
-        format!("/tmp/limux-paste-{}.png", paste_upload_token())
+        format!("/tmp/{}", paste_file_name())
     }
 
     /// Build the `scp` command that uploads `local_path` to `remote_path` on
@@ -1044,7 +1045,7 @@ fn wrap_restored_agent_command(
 /// `PATH`. For the binary to upload to a *remote* host, use
 /// [`remote_helper_cli`] instead — it prefers a static build that runs
 /// regardless of the remote's glibc version.
-pub fn limux_cli_executable() -> String {
+fn limux_cli_executable() -> String {
     std::env::current_exe()
         .ok()
         .and_then(|path| {
@@ -1280,7 +1281,7 @@ fn shell_single_quote(value: &str) -> String {
 }
 
 /// A unique token (pid + wall-clock nanos + serial) for naming a pasted-image
-/// upload. Only digits and hyphens, so it needs no shell escaping. The serial
+/// file. Only digits and hyphens, so it needs no shell escaping. The serial
 /// keeps two pastes in the same nanosecond from colliding.
 fn paste_upload_token() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1291,6 +1292,15 @@ fn paste_upload_token() -> String {
         .unwrap_or(0);
     let serial = SERIAL.fetch_add(1, Ordering::Relaxed);
     format!("{}-{nanos}-{serial}", std::process::id())
+}
+
+/// The single source of truth for a pasted-image temp-file name,
+/// `limux-paste-<token>.png` — shared by the local temp file
+/// (`terminal.rs::write_pasted_image_png`) and the remote upload path
+/// ([`SshConnection::remote_paste_path`]) so the two never drift apart. The
+/// bare name is only digits and hyphens, so it needs no shell quoting.
+pub(crate) fn paste_file_name() -> String {
+    format!("limux-paste-{}.png", paste_upload_token())
 }
 
 #[cfg(test)]
@@ -1461,6 +1471,19 @@ mod tests {
         assert!(a.starts_with("/tmp/limux-paste-"), "a={a}");
         assert!(a.ends_with(".png"), "a={a}");
         assert_ne!(a, b, "each remote paste path must be unique");
+    }
+
+    #[test]
+    fn paste_file_name_is_the_shared_unique_scheme() {
+        // The single source of truth for local + remote pasted-image names.
+        let a = paste_file_name();
+        let b = paste_file_name();
+        assert!(a.starts_with("limux-paste-"), "a={a}");
+        assert!(a.ends_with(".png"), "a={a}");
+        assert_ne!(a, b, "serial must make each name unique");
+        // remote_paste_path is /tmp/ + this name (one scheme, no drift).
+        let conn = ssh_conn("host", None, None, None, None);
+        assert!(conn.remote_paste_path().starts_with("/tmp/limux-paste-"));
     }
 
     #[test]
