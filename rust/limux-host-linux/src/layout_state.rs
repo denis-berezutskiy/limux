@@ -257,6 +257,13 @@ impl SshConnection {
         parts.push("ServerAliveInterval=15".to_string());
         parts.push("-o".to_string());
         parts.push("ServerAliveCountMax=3".to_string());
+        // Bound how long a reconnect attempt waits on an unreachable host so a
+        // black-hole outage (packets silently dropped) fails in ~10s and retries
+        // promptly, instead of hanging on the kernel's ~2-minute TCP connect
+        // timeout. The ServerAlive options above only govern an *established*
+        // link; ConnectTimeout governs a *fresh* connect.
+        parts.push("-o".to_string());
+        parts.push("ConnectTimeout=10".to_string());
         push_connection_sharing(&mut parts);
         if self.persist_tmux {
             // Force a PTY so tmux runs interactively.
@@ -1460,6 +1467,18 @@ mod tests {
             // `--` terminates options before the (attacker-influenceable) target.
             assert!(cmd.contains("'--'"), "cmd={cmd}");
         }
+    }
+
+    #[test]
+    fn reconnect_command_bounds_connect_and_keepalive_timeouts() {
+        let cmd = ssh_conn("h", None, None, None, None).reconnect_command();
+        // ServerAlive surfaces a *dropped* established link quickly; ConnectTimeout
+        // bounds a *fresh* connect so a black-hole outage retries in ~10s instead
+        // of hanging on the kernel's ~2-minute TCP timeout. Both are needed for
+        // auto-reconnect to recover promptly after a network problem.
+        assert!(cmd.contains("'-o' 'ServerAliveInterval=15'"), "cmd={cmd}");
+        assert!(cmd.contains("'-o' 'ServerAliveCountMax=3'"), "cmd={cmd}");
+        assert!(cmd.contains("'-o' 'ConnectTimeout=10'"), "cmd={cmd}");
     }
 
     #[test]

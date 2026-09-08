@@ -339,7 +339,10 @@ fn next_fast_fail_count(prev: u32, session_duration: Option<Duration>) -> u32 {
 /// the pane is up). A clean exit (0), a code-less close (`None`), a non-reconnect
 /// pane, or a *long-lived* session that exits non-zero for some other reason (a
 /// remote command genuinely failing — the user's result) is removed. Once the
-/// fast-failure count passes [`RECONNECT_FAST_FAIL_CAP`] we give up.
+/// fast-failure count passes [`RECONNECT_FAST_FAIL_CAP`] we give up — but that
+/// cap applies **only** to the startup-race path. A transport-loss drop
+/// reconnects indefinitely, however long the outage lasts, so a network problem
+/// never destroys the tab or orphans its remote tmux session.
 fn decide_exit_action(
     exit_code: Option<i32>,
     auto_reconnect: bool,
@@ -352,12 +355,23 @@ fn decide_exit_action(
     let Some(code) = exit_code.filter(|code| *code != 0) else {
         return ExitAction::Remove;
     };
+    // A dropped transport (network outage, remote reboot, a lost tmux link) must
+    // never destroy the tab: the remote tmux session outlives the connection, so
+    // keep retrying however long the outage lasts and rebind to that same session
+    // on the next successful connect. Giving up here would orphan the remote
+    // session and lose the tab — and, when it is the workspace's last tab, close
+    // the whole workspace.
+    if SSH_TRANSPORT_LOSS_CODES.contains(&code) {
+        return ExitAction::Reconnect;
+    }
+    // Non-transport failures are not a lost link. Only the surface-realization
+    // startup race (a spurious pre-realization exit) is worth retrying, and only
+    // up to the cap so a permanently-broken command can't loop forever.
     if fast_fail_count > RECONNECT_FAST_FAIL_CAP {
         return ExitAction::GiveUp;
     }
-    let transport_loss = SSH_TRANSPORT_LOSS_CODES.contains(&code);
     let died_during_startup = session_duration.is_some_and(|d| d < FAST_FAIL_WINDOW);
-    if transport_loss || died_during_startup {
+    if died_during_startup {
         ExitAction::Reconnect
     } else {
         ExitAction::Remove
@@ -5042,14 +5056,26 @@ mod tests {
     #[test]
     fn decide_exit_action_gives_up_past_the_fast_fail_cap() {
         let long = Some(Duration::from_secs(10));
-        // At and below the cap we keep reconnecting; only once the count passes
-        // the cap do we give up.
+        let short = Some(Duration::from_millis(500));
+        // Transport-loss drops never give up, however many times they fast-fail:
+        // the remote tmux session is still there to rebind to when the link
+        // returns, so we keep retrying instead of destroying the tab.
         assert_eq!(
-            decide_exit_action(Some(255), true, RECONNECT_FAST_FAIL_CAP, long),
+            decide_exit_action(Some(255), true, RECONNECT_FAST_FAIL_CAP + 1, long),
             ExitAction::Reconnect
         );
         assert_eq!(
-            decide_exit_action(Some(255), true, RECONNECT_FAST_FAIL_CAP + 1, long),
+            decide_exit_action(Some(255), true, RECONNECT_FAST_FAIL_CAP + 100, short),
+            ExitAction::Reconnect
+        );
+        // A non-transport startup-race exit keeps retrying up to the cap, then
+        // gives up so a permanently-broken command can't loop forever.
+        assert_eq!(
+            decide_exit_action(Some(127), true, RECONNECT_FAST_FAIL_CAP, short),
+            ExitAction::Reconnect
+        );
+        assert_eq!(
+            decide_exit_action(Some(127), true, RECONNECT_FAST_FAIL_CAP + 1, short),
             ExitAction::GiveUp
         );
     }
