@@ -398,6 +398,7 @@ for regression in \
   terminal::tests::detach_after_repaint_waits_for_a_frame_without_the_widget \
   window::pane_create_tests::pane_create_replies_once_the_new_pane_can_be_targeted \
   window::ssh_launch_tests::ssh_launch_is_explicit_and_not_persisted \
+  window::ssh_launch_tests::persistent_ssh_restores_retries_moves_and_closes \
   window::tab_move_tests::moving_a_first_tab_to_another_workspace_keeps_tab_ids_unique; do
   cargo test --locked $CARGO_FLAGS -p limux-host-linux "$regression" \
     -- --exact --ignored --test-threads=1 --nocapture

@@ -194,6 +194,8 @@ pub enum TabContentState {
         cwd: Option<String>,
         #[serde(default)]
         agent: Option<RestorableAgentState>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssh: Option<Box<crate::ssh_session::SshConnection>>,
     },
     Browser {
         #[serde(default)]
@@ -235,6 +237,14 @@ impl Default for AppSessionState {
 }
 
 impl PaneState {
+    pub fn ssh(connection: crate::ssh_session::SshConnection) -> Self {
+        let mut pane = Self::fallback(None);
+        if let TabContentState::Terminal { ssh, .. } = &mut pane.tabs[0].content {
+            *ssh = Some(Box::new(connection));
+        }
+        pane
+    }
+
     pub fn fallback(working_directory: Option<&str>) -> Self {
         let tab = TabState::terminal(new_tab_id(), working_directory);
         Self {
@@ -263,6 +273,7 @@ impl TabState {
             content: TabContentState::Terminal {
                 cwd: cwd.map(|value| value.to_string()),
                 agent: None,
+                ssh: None,
             },
         }
     }
@@ -1458,6 +1469,7 @@ mod tests {
                 custom_name: None,
                 pinned: false,
                 content: TabContentState::Terminal {
+                    ssh: None,
                     cwd: Some("/tmp/project".to_string()),
                     agent: Some(RestorableAgentState {
                         kind: RestorableAgentKind::Codex,
@@ -1543,6 +1555,7 @@ mod tests {
             custom_name: None,
             pinned: false,
             content: TabContentState::Terminal {
+                ssh: None,
                 cwd: Some("/tmp/project".to_string()),
                 agent: Some(RestorableAgentState {
                     kind: RestorableAgentKind::Codex,
