@@ -3,6 +3,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+"$ROOT_DIR/scripts/check-ghostty.sh"
 for dependency in xvfb-run xdotool metacity dbus-run-session jq setsid timeout; do
   command -v "$dependency" >/dev/null || { echo "Missing dependency: $dependency"; exit 2; }
 done

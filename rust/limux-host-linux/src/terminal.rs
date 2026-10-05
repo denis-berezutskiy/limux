@@ -102,7 +102,7 @@ struct SurfaceEntry {
 
 struct ClipboardContext {
     surface: Cell<ghostty_surface_t>,
-    copy_selection_to_clipboard: Rc<dyn Fn() -> bool>,
+    callbacks: Rc<RefCell<TerminalCallbacks>>,
     url_probe: RefCell<Option<String>>,
     url_probe_active: Cell<bool>,
 }
@@ -259,6 +259,24 @@ pub struct TerminalHealth {
 }
 
 impl TerminalHandle {
+    #[cfg(test)]
+    pub(crate) fn build_context_menu_for_test(&self) -> gtk::Popover {
+        let overlay = self
+            .gl_area
+            .ancestor(gtk::Overlay::static_type())
+            .and_downcast::<gtk::Overlay>()
+            .expect("terminal overlay");
+        build_terminal_context_menu(
+            &self.gl_area,
+            &overlay,
+            *self.surface_cell.borrow(),
+            &self.callbacks,
+            10.0,
+            10.0,
+            0,
+        )
+    }
+
     pub fn replace_callbacks(&self, callbacks: TerminalCallbacks) {
         if !self.shutting_down.get() {
             *self.callbacks.borrow_mut() = callbacks;
@@ -400,7 +418,7 @@ impl TerminalHandle {
         // The CString must outlive the ghostty call below; `text` owns it until the
         // end of this function.
         if let Some(text) = text.as_ref() {
-            press.text = text.as_ptr();
+            press.input.text = text.as_ptr();
         }
 
         // Release carries no text, matching the GTK controller.
@@ -414,8 +432,8 @@ impl TerminalHandle {
         );
 
         unsafe {
-            ghostty_surface_key(surface, press);
-            ghostty_surface_key(surface, release);
+            ghostty_surface_key_with_key(surface, press.input, press.resolved_key);
+            ghostty_surface_key_with_key(surface, release.input, release.resolved_key);
         }
         drop(text);
         true
@@ -1330,6 +1348,8 @@ pub struct TerminalCallbacks {
     pub on_split_down: Box<VoidCallback>,
     pub on_open_keybinds: Box<WidgetCallback>,
     pub identity: Box<IdentityCallback>,
+    pub hover_focus: Box<dyn Fn() -> bool>,
+    pub copy_selection_to_clipboard: Box<dyn Fn() -> bool>,
 }
 
 impl TerminalCallbacks {
@@ -1349,13 +1369,14 @@ impl TerminalCallbacks {
                 workspace_id: None,
                 surface_id: String::new(),
             }),
+            hover_focus: Box::new(|| false),
+            copy_selection_to_clipboard: Box::new(|| false),
         }
     }
 }
 
+#[derive(Default)]
 pub struct TerminalOptions {
-    pub hover_focus: Rc<dyn Fn() -> bool>,
-    pub copy_selection_to_clipboard: Rc<dyn Fn() -> bool>,
     pub saved_font_size: Option<f32>,
     pub startup_command: Option<String>,
     pub initial_input: Option<String>,
@@ -1367,19 +1388,6 @@ pub struct TerminalOptions {
     /// to call `limux identify` first. This is the foundation for the cmux
     /// agent-to-agent communication workflow.
     pub extra_env: Vec<(String, String)>,
-}
-
-impl Default for TerminalOptions {
-    fn default() -> Self {
-        Self {
-            hover_focus: Rc::new(|| false),
-            copy_selection_to_clipboard: Rc::new(|| true),
-            saved_font_size: None,
-            startup_command: None,
-            initial_input: None,
-            extra_env: Vec::new(),
-        }
-    }
 }
 
 /// Default font-size from ghostty config (cached on first access).
@@ -1443,6 +1451,7 @@ pub(crate) fn detach_after_repaint(widget: &gtk::Widget, detach: impl FnOnce() +
         detach();
         return;
     };
+    unset_focus_within(widget);
     widget.set_visible(false);
 
     let detach = Rc::new(RefCell::new(Some(detach)));
@@ -1494,6 +1503,32 @@ pub(crate) fn detach_after_repaint(widget: &gtk::Widget, detach: impl FnOnce() +
     *timeout.borrow_mut() = Some(source);
 }
 
+/// Unset the window's focus when it is inside `widget`, before `widget` is
+/// hidden or unparented.
+///
+/// Hiding or unparenting the focus, or an ancestor of it, makes GTK keep that
+/// widget to move the focus from at the next frame. GTK 4.22 overwrites the
+/// ref when another such call lands first, so the widget and its whole tree
+/// leak (fixed on GTK main by a6e1c8a5). Teardowns chain them: hiding a
+/// stack's visible child makes the stack drop it too, closing a pane hides
+/// the old split tree and then the pane, a popover hides and then unparents.
+/// Where the focus should go next is up to the caller (the next tab, the pane
+/// or workspace that takes the place).
+pub(crate) fn unset_focus_within(widget: &gtk::Widget) {
+    if focus_is_within(widget) {
+        if let Some(root) = widget.root() {
+            root.set_focus(None::<&gtk::Widget>);
+        }
+    }
+}
+
+pub(crate) fn focus_is_within(widget: &gtk::Widget) -> bool {
+    widget
+        .root()
+        .and_then(|root| root.focus())
+        .is_some_and(|focus| &focus == widget || focus.is_ancestor(widget))
+}
+
 /// Remove `widget` from its `gtk::Stack` once its window has painted a frame
 /// without it (see [`detach_after_repaint`]).
 pub(crate) fn remove_from_stack_after_repaint(widget: &gtk::Widget) {
@@ -1533,8 +1568,6 @@ pub fn create_terminal(
     let saved_font_size = options.saved_font_size;
     let startup_command = options.startup_command;
     let initial_input = options.initial_input;
-    let hover_focus = options.hover_focus;
-    let copy_selection_to_clipboard = options.copy_selection_to_clipboard;
     let extra_env = options.extra_env;
     let callbacks = Rc::new(RefCell::new(callbacks));
     let surface_cell: Rc<RefCell<Option<ghostty_surface_t>>> = Rc::new(RefCell::new(None));
@@ -1734,7 +1767,7 @@ pub fn create_terminal(
             let mut config = unsafe { ghostty_surface_config_new() };
             let clipboard_context = Box::into_raw(Box::new(ClipboardContext {
                 surface: Cell::new(ptr::null_mut()),
-                copy_selection_to_clipboard: copy_selection_to_clipboard.clone(),
+                callbacks: callbacks.clone(),
                 url_probe: RefCell::new(None),
                 url_probe_active: Cell::new(false),
             }));
@@ -1997,10 +2030,12 @@ pub fn create_terminal(
                     .borrow_mut()
                     .take_event_text(fallback_text);
                 if let Some(ref ct) = c_text {
-                    event.text = ct.as_ptr();
+                    event.input.text = ct.as_ptr();
                 }
 
-                let consumed = unsafe { ghostty_surface_key(surface, event) };
+                let consumed = unsafe {
+                    ghostty_surface_key_with_key(surface, event.input, event.resolved_key)
+                };
                 if consumed && pane_ime_press.state.borrow().composing {
                     crate::ime::reset_after_consumed_compose(surface, &pane_ime_press);
                 }
@@ -2038,7 +2073,7 @@ pub fn create_terminal(
                     keycode,
                     modifier,
                 );
-                unsafe { ghostty_surface_key(surface, event) };
+                unsafe { ghostty_surface_key_with_key(surface, event.input, event.resolved_key) };
                 pane_ime_release.state.borrow_mut().finish_key_event();
             }
         });
@@ -2125,12 +2160,13 @@ pub fn create_terminal(
         let surface_cell_for_enter = surface_cell.clone();
         let gl_for_focus = gl_area.clone();
         let had_focus = had_focus.clone();
+        let callbacks = callbacks.clone();
         let cursor_pos_enter = cursor_pos.clone();
         let cursor_pos_motion = cursor_pos.clone();
         let link_popover_motion = link_popover.clone();
         let motion = gtk::EventControllerMotion::new();
         motion.connect_enter(move |ctrl, x, y| {
-            if (hover_focus)() {
+            if (callbacks.borrow().hover_focus)() {
                 // Match common Hyprland/Omarchy-style focus-follows-mouse behavior:
                 // as soon as the pointer enters a terminal, focus it so typing works
                 // immediately without an extra click.
@@ -2442,6 +2478,27 @@ fn show_terminal_context_menu(
         return;
     }
 
+    let popover = build_terminal_context_menu(gl_area, overlay, surface, callbacks, x, y, mods);
+    if widget_has_native_surface(gl_area) {
+        popover.popup();
+    }
+    // The `closed` handler detaches the menu, but GTK emits `closed` only when
+    // it hides a menu it presented: emit it for one never shown, or one the
+    // compositor refused (a popup grab it rejects, or no seat at all).
+    if !popover.is_mapped() {
+        popover.emit_by_name::<()>("closed", &[]);
+    }
+}
+
+fn build_terminal_context_menu(
+    gl_area: &gtk::GLArea,
+    overlay: &gtk::Overlay,
+    surface: Option<ghostty_surface_t>,
+    callbacks: &Rc<RefCell<TerminalCallbacks>>,
+    x: f64,
+    y: f64,
+    mods: c_int,
+) -> gtk::Popover {
     let menu_box = build_popover_inner_box();
     let url = url_at_position(surface, x, y, mods);
 
@@ -2563,11 +2620,13 @@ fn show_terminal_context_menu(
     while let Some(widget) = child {
         if let Some(btn) = widget.downcast_ref::<gtk::Button>() {
             let label = btn.label().unwrap_or_default().to_string();
+            // Weak: GTK 4.22 can keep a closed menu alive, which must not keep
+            // the terminal alive with it.
             let pop = popover.downgrade();
             let cb = callbacks.clone();
-            let gl_area = gl_area.clone();
+            let gl_area = gl_area.downgrade();
             let url = url.clone();
-            let overlay = overlay.clone();
+            let overlay = overlay.downgrade();
 
             btn.connect_clicked(move |_| {
                 let Some(pop) = pop.upgrade() else {
@@ -2579,7 +2638,9 @@ fn show_terminal_context_menu(
                     "Copy URL" => {
                         if let Some(url) = url.as_deref() {
                             copy_text_to_clipboards(url);
-                            show_clipboard_toast(&overlay);
+                            if let Some(overlay) = overlay.upgrade() {
+                                show_clipboard_toast(&overlay);
+                            }
                         }
                     }
                     "Paste" => surface_action(surface, "paste_from_clipboard"),
@@ -2596,12 +2657,14 @@ fn show_terminal_context_menu(
                         (callbacks.on_split_down)();
                     }
                     "Keybinds" => {
-                        let anchor: gtk::Widget = gl_area.clone().upcast();
-                        let cb = cb.clone();
-                        glib::timeout_add_local_once(Duration::from_millis(80), move || {
-                            let callbacks = cb.borrow();
-                            (callbacks.on_open_keybinds)(&anchor);
-                        });
+                        if let Some(gl_area) = gl_area.upgrade() {
+                            let anchor: gtk::Widget = gl_area.upcast();
+                            let cb = cb.clone();
+                            glib::timeout_add_local_once(Duration::from_millis(80), move || {
+                                let callbacks = cb.borrow();
+                                (callbacks.on_open_keybinds)(&anchor);
+                            });
+                        }
                     }
                     "Clear" => surface_action(surface, "clear_screen"),
                     _ => {}
@@ -2619,13 +2682,10 @@ fn show_terminal_context_menu(
         (open_browser_tab_btn, LinkOpenDestination::BrowserTab),
     ] {
         let pop = popover.downgrade();
-        let open_in_pop = open_in_popover.downgrade();
         let callbacks = callbacks.clone();
         let url = url.clone();
         button.connect_clicked(move |_| {
-            if let Some(open_in_pop) = open_in_pop.upgrade() {
-                open_in_pop.popdown();
-            }
+            // The menu's closed handler closes the submenu too.
             if let Some(pop) = pop.upgrade() {
                 pop.popdown();
             }
@@ -2637,17 +2697,16 @@ fn show_terminal_context_menu(
 
     {
         let pop = popover.downgrade();
-        let ids_pop = ids_popover.downgrade();
-        let overlay = overlay.clone();
+        let overlay = overlay.downgrade();
         let workspace_id = identity.workspace_id.clone();
         copy_workspace_btn.connect_clicked(move |_| {
             if let Some(workspace_id) = workspace_id.as_deref() {
                 copy_text_to_clipboards(workspace_id);
-                show_clipboard_toast(&overlay);
+                if let Some(overlay) = overlay.upgrade() {
+                    show_clipboard_toast(&overlay);
+                }
             }
-            if let Some(ids_pop) = ids_pop.upgrade() {
-                ids_pop.popdown();
-            }
+            // The menu's closed handler closes the submenu too.
             if let Some(pop) = pop.upgrade() {
                 pop.popdown();
             }
@@ -2656,15 +2715,14 @@ fn show_terminal_context_menu(
 
     {
         let pop = popover.downgrade();
-        let ids_pop = ids_popover.downgrade();
-        let overlay = overlay.clone();
+        let overlay = overlay.downgrade();
         let surface_id = identity.surface_id.clone();
         copy_surface_btn.connect_clicked(move |_| {
             copy_text_to_clipboards(&surface_id);
-            show_clipboard_toast(&overlay);
-            if let Some(ids_pop) = ids_pop.upgrade() {
-                ids_pop.popdown();
+            if let Some(overlay) = overlay.upgrade() {
+                show_clipboard_toast(&overlay);
             }
+            // The menu's closed handler closes the submenu too.
             if let Some(pop) = pop.upgrade() {
                 pop.popdown();
             }
@@ -2674,7 +2732,15 @@ fn show_terminal_context_menu(
     {
         let ids_menu_button = ids_menu_button.clone();
         let open_in_menu_button = open_in_menu_button.clone();
+        let gl = gl_area.downgrade();
         popover.connect_closed(move |p| {
+            // Give the focus back to the terminal before the submenus and the
+            // menu are unparented, or GTK 4.22 leaks them (see
+            // `unset_focus_within`). A visible focus also drops the move the
+            // closing hide queued.
+            if focus_is_within(p.upcast_ref()) && !gl.upgrade().is_some_and(|gl| gl.grab_focus()) {
+                unset_focus_within(p.upcast_ref());
+            }
             ids_menu_button.popdown();
             ids_menu_button.set_popover(None::<&gtk::Popover>);
             open_in_menu_button.popdown();
@@ -2683,18 +2749,17 @@ fn show_terminal_context_menu(
         });
     }
 
-    if widget_has_native_surface(gl_area) {
-        popover.popup();
-    } else {
-        ids_menu_button.set_popover(None::<&gtk::Popover>);
-        open_in_menu_button.set_popover(None::<&gtk::Popover>);
-        popover.unparent();
-    }
+    popover
 }
 
 // ---------------------------------------------------------------------------
 // Key translation
 // ---------------------------------------------------------------------------
+
+struct TranslatedKeyEvent {
+    input: ghostty_input_key_s,
+    resolved_key: c_int,
+}
 
 fn translate_key_event(
     action: c_int,
@@ -2703,7 +2768,7 @@ fn translate_key_event(
     keyval: gtk::gdk::Key,
     keycode: u32,
     modifier: gtk::gdk::ModifierType,
-) -> ghostty_input_key_s {
+) -> TranslatedKeyEvent {
     let mut mods: c_int = GHOSTTY_MODS_NONE;
     if modifier.contains(gtk::gdk::ModifierType::SHIFT_MASK) {
         mods |= GHOSTTY_MODS_SHIFT;
@@ -2728,15 +2793,17 @@ fn translate_key_event(
         .unwrap_or_else(|| fallback_consumed_mods(keyval, modifier));
     let keycode = ghostty_keycode_with_keyval_remap(keyval, keycode);
 
-    ghostty_input_key_s {
-        action,
-        mods,
-        consumed_mods: consumed,
-        keycode,
-        text: ptr::null(),
-        unshifted_codepoint: unshifted,
-        composing: false,
-        key: ghostty_key_for_keyval(keyval),
+    TranslatedKeyEvent {
+        input: ghostty_input_key_s {
+            action,
+            mods,
+            consumed_mods: consumed,
+            keycode,
+            text: ptr::null(),
+            unshifted_codepoint: unshifted,
+            composing: false,
+        },
+        resolved_key: ghostty_key_for_keyval(keyval),
     }
 }
 
@@ -2913,67 +2980,46 @@ fn fallback_unshifted_codepoint(keyval: gtk::gdk::Key) -> u32 {
     }
 }
 
+/// Styles for the clipboard toast, installed once with the app stylesheet.
+pub(crate) const CLIPBOARD_TOAST_CSS: &str = r#"
+label.limux-toast {
+    background: rgba(45, 45, 45, 0.95);
+    color: white;
+    border-radius: 6px;
+    padding: 6px 14px;
+    font-size: 12px;
+}
+"#;
+
 /// Show a brief "Copied to clipboard" toast at the bottom of the terminal.
 fn show_clipboard_toast(overlay: &gtk::Overlay) {
-    let toast = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    // One toast per terminal: a new copy, OSC 52 writes included, replaces the
+    // one shown, so it stays 2 s after the last copy instead of stacking.
+    let mut child = overlay.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if widget.has_css_class("limux-toast") {
+            overlay.remove_overlay(&widget);
+        }
+    }
+
+    let toast = gtk::Label::new(Some("Copied to clipboard"));
+    toast.add_css_class("limux-toast");
     toast.set_halign(gtk::Align::Center);
     toast.set_valign(gtk::Align::End);
     toast.set_margin_bottom(12);
-
-    let provider = gtk::CssProvider::new();
-    provider.load_from_data(
-        "box.limux-toast { \
-            background: rgba(45, 45, 45, 0.95); \
-            color: white; \
-            border-radius: 6px; \
-            padding: 6px 14px; \
-            font-size: 12px; \
-        } \
-        box.limux-toast label { color: white; } \
-        box.limux-toast button { \
-            color: rgba(255,255,255,0.5); \
-            border: none; \
-            background: none; \
-            min-height: 0; min-width: 0; \
-            padding: 0 2px; \
-        } \
-        box.limux-toast button:hover { color: white; }",
-    );
-    gtk::style_context_add_provider_for_display(
-        &gtk::gdk::Display::default().expect("display"),
-        &provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
-
-    toast.add_css_class("limux-toast");
-    let label = gtk::Label::new(Some("Copied to clipboard"));
-    let close_btn = gtk::Button::with_label("\u{00D7}"); // ×
-    toast.append(&label);
-    toast.append(&close_btn);
     toast.set_can_target(false);
-
     overlay.add_overlay(&toast);
 
-    // Close button dismisses immediately
-    {
-        let t = toast.clone();
-        let o = overlay.clone();
-        close_btn.set_can_target(true);
-        close_btn.connect_clicked(move |_| {
-            o.remove_overlay(&t);
-        });
-    }
-
-    // Auto-dismiss after 2 seconds
-    {
-        let t = toast.clone();
-        let o = overlay.clone();
-        glib::timeout_add_local_once(std::time::Duration::from_secs(2), move || {
-            if t.parent().is_some() {
-                o.remove_overlay(&t);
+    // Weak, so a toast whose terminal has closed is freed at once.
+    let toast = toast.downgrade();
+    glib::timeout_add_local_once(Duration::from_secs(2), move || {
+        if let Some(toast) = toast.upgrade() {
+            if let Some(overlay) = toast.parent().and_downcast::<gtk::Overlay>() {
+                overlay.remove_overlay(&toast);
             }
-        });
-    }
+        }
+    });
 }
 
 fn dropped_file_text(file_list: &gtk::gdk::FileList) -> Option<CString> {
@@ -3063,6 +3109,138 @@ mod tests {
         // makes every context-menu item below it need two clicks.
         assert!(!popover.is_autohide());
         assert_eq!(button.popover().as_ref(), Some(&popover));
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn clipboard_toast_never_retains_its_terminal() {
+        gtk::init().expect("GTK display required");
+        let context = glib::MainContext::default();
+
+        // Dropped while the auto-dismiss timeout is still pending.
+        let overlay = gtk::Overlay::new();
+        show_clipboard_toast(&overlay);
+        let toast = overlay.last_child().expect("toast").downgrade();
+        let weak_overlay = overlay.downgrade();
+        drop(overlay);
+        assert!(weak_overlay.upgrade().is_none(), "timeout kept the overlay");
+        assert!(toast.upgrade().is_none(), "toast outlived its overlay");
+
+        // Dismissed by its timeout, and freed then.
+        let overlay = gtk::Overlay::new();
+        show_clipboard_toast(&overlay);
+        let toast = overlay.last_child().expect("toast").downgrade();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while toast.upgrade().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "toast never dismissed itself"
+            );
+            if !context.iteration(false) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(
+            overlay.first_child().is_none(),
+            "dismissal left a widget behind"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn repeated_copies_show_a_single_clipboard_toast() {
+        gtk::init().expect("GTK display required");
+        let context = glib::MainContext::default();
+        let run_until = |deadline: std::time::Instant| {
+            while std::time::Instant::now() < deadline {
+                if !context.iteration(false) {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        let start = std::time::Instant::now();
+        let overlay = gtk::Overlay::new();
+        show_clipboard_toast(&overlay);
+        let first = overlay.last_child().expect("toast").downgrade();
+        run_until(start + Duration::from_secs(1));
+        for _ in 0..2 {
+            show_clipboard_toast(&overlay);
+        }
+        assert!(
+            first.upgrade().is_none(),
+            "a new copy did not restart the toast"
+        );
+        let last = overlay.last_child().expect("toast").downgrade();
+
+        // Past the first copy's 2 s, the last copy's toast is still up.
+        run_until(start + Duration::from_millis(2500));
+        assert!(
+            last.upgrade().is_some_and(|toast| toast.parent().is_some()),
+            "the first copy's timeout dismissed the last copy's toast"
+        );
+        let mut toasts = 0;
+        let mut child = overlay.first_child();
+        while let Some(widget) = child {
+            toasts += usize::from(widget.has_css_class("limux-toast"));
+            child = widget.next_sibling();
+        }
+        assert_eq!(toasts, 1, "each copy stacked another toast");
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn context_menu_never_retains_its_terminal() {
+        gtk::init().expect("GTK display required");
+        let gl_area = gtk::GLArea::new();
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&gl_area));
+        let callbacks = Rc::new(RefCell::new(TerminalCallbacks::disconnected()));
+        let menu = build_terminal_context_menu(&gl_area, &overlay, None, &callbacks, 10.0, 10.0, 0);
+        menu.emit_by_name::<()>("closed", &[]);
+        assert!(menu.parent().is_none(), "closing left the menu attached");
+
+        // The closed menu outlives its terminal, as GTK 4.22 keeps one closed
+        // with the focus inside it alive: its items must not keep the terminal.
+        let weak_gl_area = gl_area.downgrade();
+        let weak_overlay = overlay.downgrade();
+        drop((gl_area, overlay));
+        assert!(
+            weak_gl_area.upgrade().is_none(),
+            "the context menu kept the GL area"
+        );
+        assert!(
+            weak_overlay.upgrade().is_none(),
+            "the context menu kept the overlay"
+        );
+        drop(menu);
+    }
+
+    #[test]
+    #[ignore = "requires a graphical display"]
+    fn context_menu_the_compositor_refuses_is_detached() {
+        gtk::init().expect("GTK display required");
+        let gl_area = gtk::GLArea::new();
+        let overlay = gtk::Overlay::new();
+        overlay.set_child(Some(&gl_area));
+        let window = gtk::Window::builder().child(&overlay).build();
+        window.present();
+        assert!(widget_has_native_surface(&gl_area));
+
+        // The headless smoke compositor has no seat, so it refuses the menu's
+        // popup grab, as a compositor does for a grab it rejects: GTK then
+        // never emits `closed`. A presented menu may stay; a refused one not.
+        let callbacks = Rc::new(RefCell::new(TerminalCallbacks::disconnected()));
+        show_terminal_context_menu(&gl_area, &overlay, None, &callbacks, 10.0, 10.0, 0);
+        if let Some(menu) = gl_area.first_child() {
+            assert!(
+                menu.is_mapped(),
+                "a menu the compositor refused stayed attached"
+            );
+            menu.downcast::<gtk::Popover>()
+                .expect("context menu")
+                .popdown();
+        }
+        window.close();
     }
 
     #[test]
@@ -3531,9 +3709,9 @@ mod tests {
             modifiers,
         );
 
-        assert_eq!(caps_as_escape.keycode, 9);
-        assert_eq!(escape_as_caps.keycode, 66);
-        assert_eq!(writing_key.keycode, 38);
+        assert_eq!(caps_as_escape.input.keycode, 9);
+        assert_eq!(escape_as_caps.input.keycode, 66);
+        assert_eq!(writing_key.input.keycode, 38);
     }
 
     #[test]
@@ -3564,8 +3742,8 @@ mod tests {
                 physical,
                 modifiers,
             );
-            assert_eq!(event.keycode, physical, "{keyval:?}");
-            assert_eq!(event.key, key, "{keyval:?}");
+            assert_eq!(event.input.keycode, physical, "{keyval:?}");
+            assert_eq!(event.resolved_key, key, "{keyval:?}");
         }
 
         let digit = translate_key_event(
@@ -3576,8 +3754,8 @@ mod tests {
             87,
             modifiers,
         );
-        assert_eq!(digit.keycode, 87);
-        assert_eq!(digit.key, GHOSTTY_KEY_NUMPAD_1);
+        assert_eq!(digit.input.keycode, 87);
+        assert_eq!(digit.resolved_key, GHOSTTY_KEY_NUMPAD_1);
 
         let regular_end = translate_key_event(
             GHOSTTY_ACTION_PRESS,
@@ -3587,8 +3765,8 @@ mod tests {
             115,
             modifiers,
         );
-        assert_eq!(regular_end.keycode, 115);
-        assert_eq!(regular_end.key, GHOSTTY_KEY_UNIDENTIFIED);
+        assert_eq!(regular_end.input.keycode, 115);
+        assert_eq!(regular_end.resolved_key, GHOSTTY_KEY_UNIDENTIFIED);
     }
 
     #[test]

@@ -78,6 +78,24 @@ impl SplitNode {
         }
     }
 
+    /// The pane nearest to `target` in the sibling that `remove` promotes.
+    fn successor_of(&self, target: &gtk::Widget) -> Option<gtk::Widget> {
+        let SplitNode::Split { left, right, .. } = self else {
+            return None;
+        };
+        let mut panes = Vec::new();
+        if matches!(left.as_ref(), SplitNode::Leaf { pane_widget } if pane_widget == target) {
+            right.collect_panes(&mut panes);
+            return panes.into_iter().next();
+        }
+        if matches!(right.as_ref(), SplitNode::Leaf { pane_widget } if pane_widget == target) {
+            left.collect_panes(&mut panes);
+            return panes.pop();
+        }
+        left.successor_of(target)
+            .or_else(|| right.successor_of(target))
+    }
+
     /// Find the leaf containing `target` and promote its sibling in place.
     pub(crate) fn remove(&mut self, target: &gtk::Widget) -> bool {
         match self {
@@ -149,7 +167,9 @@ pub(crate) struct SplitTreeContainer {
     rebuild_source: RefCell<Option<glib::SourceId>>,
     teardown_pending: Cell<bool>,
     after_rebuild: RefCell<Vec<Box<dyn FnOnce()>>>,
-    last_focused: RefCell<Option<gtk::Widget>>,
+    /// Weak: `remove` saves the focus before a pane closes, and that focus is
+    /// usually inside the closing pane.
+    last_focused: RefCell<Option<glib::WeakRef<gtk::Widget>>>,
     zoomed_pane: RefCell<Option<gtk::Widget>>,
     state: State,
 }
@@ -241,7 +261,7 @@ impl SplitTreeContainer {
             return false;
         }
         self.zoomed_pane.borrow_mut().take();
-        *self.last_focused.borrow_mut() = Some(target.clone());
+        *self.last_focused.borrow_mut() = Some(target.downgrade());
         self.trigger_rebuild();
         true
     }
@@ -249,7 +269,7 @@ impl SplitTreeContainer {
     fn zoom_pane(self: &Rc<Self>, target: &gtk::Widget) {
         self.save_focus();
         *self.zoomed_pane.borrow_mut() = Some(target.clone());
-        *self.last_focused.borrow_mut() = Some(target.clone());
+        *self.last_focused.borrow_mut() = Some(target.downgrade());
         self.trigger_rebuild();
     }
 
@@ -278,7 +298,7 @@ impl SplitTreeContainer {
 
         self.save_focus();
         self.zoomed_pane.borrow_mut().take();
-        *self.last_focused.borrow_mut() = Some(new_pane.clone());
+        *self.last_focused.borrow_mut() = Some(new_pane.downgrade());
 
         let shared_ratio = Rc::new(RefCell::new(layout_state::clamp_split_ratio(ratio)));
         let new_node = if new_pane_first {
@@ -321,12 +341,23 @@ impl SplitTreeContainer {
         self.save_focus();
         self.zoomed_pane.borrow_mut().take();
 
-        let removed = {
+        let (removed, successor) = {
             let mut tree = self.tree.borrow_mut();
-            tree.remove(target)
+            let successor = tree.successor_of(target);
+            (tree.remove(target), successor)
         };
 
         if removed {
+            // The focus was in the closed pane: the pane that takes its place
+            // gets it after the rebuild.
+            let focus = self
+                .last_focused
+                .borrow()
+                .as_ref()
+                .and_then(|w| w.upgrade());
+            if focus.is_some_and(|focus| &focus == target || focus.is_ancestor(target)) {
+                *self.last_focused.borrow_mut() = successor.map(|pane| pane.downgrade());
+            }
             self.trigger_rebuild();
         }
         removed
@@ -430,8 +461,13 @@ impl SplitTreeContainer {
         // Newly created panes are tracked as pane containers rather than the
         // inner terminal/browser widget, so restore through the pane helper
         // when possible and fall back to plain widget focus otherwise.
-        if let Some(focused) = self.last_focused.borrow().as_ref() {
-            if !pane::focus_active_tab_in_pane(focused) {
+        let focused = self
+            .last_focused
+            .borrow()
+            .as_ref()
+            .and_then(|w| w.upgrade());
+        if let Some(focused) = focused {
+            if !pane::focus_active_tab_in_pane(&focused) {
                 focused.grab_focus();
             }
         }
@@ -439,12 +475,18 @@ impl SplitTreeContainer {
     }
 
     fn save_focus(&self) {
+        // A teardown under way unset the focus on purpose (see
+        // `terminal::unset_focus_within`): the focus saved before it still
+        // stands.
+        if self.teardown_pending.get() || self.rebuild_source.borrow().is_some() {
+            return;
+        }
         let focus = self
             .bin
             .root()
             .and_then(|r| r.downcast::<gtk::Window>().ok())
             .and_then(|w| gtk::prelude::GtkWindowExt::focus(&w));
-        *self.last_focused.borrow_mut() = focus;
+        *self.last_focused.borrow_mut() = focus.map(|focus| focus.downgrade());
     }
 }
 
@@ -593,6 +635,13 @@ fn install_split_ratio_tracking(paned: &gtk::Paned, ratio: &Rc<RefCell<f64>>) {
             // here would suppress the tick's re-apply and drift the split.
             return;
         }
+        // A drag past a child's minimum would let GTK clip that pane.
+        let clamped = clamp_paned_position(paned, paned.position());
+        if clamped != paned.position() {
+            applying_for_notify.set(true);
+            paned.set_position(clamped);
+            applying_for_notify.set(false);
+        }
         let new_ratio = layout_state::snapshot_split_ratio(
             paned.position(),
             size,
@@ -663,6 +712,54 @@ fn minimum_split_extent(orientation: gtk::Orientation) -> i32 {
     } else {
         pane::MIN_PANE_HEIGHT
     }
+}
+
+/// Clamps `position` so neither child of `paned` drops below its minimum
+/// extent (see `layout_state::clamp_split_position`).
+pub(crate) fn clamp_paned_position(paned: &gtk::Paned, position: i32) -> i32 {
+    let orientation = paned.orientation();
+    let child_min = |child: Option<gtk::Widget>| {
+        child.map_or(0, |child| subtree_min_extent(&child, orientation))
+    };
+    layout_state::clamp_split_position(
+        position,
+        child_min(paned.start_child()),
+        child_min(paned.end_child()),
+        paned.max_position(),
+    )
+}
+
+/// Minimum extent of a split subtree along `orientation`: leaves contribute
+/// the pane minimum, nested splits sum them (same orientation) or take the
+/// larger (cross orientation).
+fn subtree_min_extent(widget: &gtk::Widget, orientation: gtk::Orientation) -> i32 {
+    if !widget.is_visible() {
+        return 0;
+    }
+    let Some(paned) = widget.downcast_ref::<gtk::Paned>() else {
+        // The pane minimum, not the measured one: the tab strip does not
+        // scroll, so the measured width grows with every tab and would skew
+        // even splits (the reason the paned children shrink).
+        return minimum_split_extent(orientation);
+    };
+    let start = paned
+        .start_child()
+        .map_or(0, |child| subtree_min_extent(&child, orientation));
+    let end = paned
+        .end_child()
+        .map_or(0, |child| subtree_min_extent(&child, orientation));
+    let along = paned.orientation() == orientation;
+    let handle = if along {
+        // Both children of Limux splits are shrinkable, so GTK's minimum
+        // extent along the Paned's axis is the separator size. Measure it
+        // directly: extent - max_position undercounts when the current
+        // allocation is smaller than the handle (GTK clamps that allocation
+        // to one pixel).
+        paned.measure(orientation, -1).0
+    } else {
+        0
+    };
+    layout_state::nested_split_min_extent(start, end, along, handle)
 }
 
 fn split_extent_has_room(size: i32, orientation: gtk::Orientation) -> bool {
@@ -769,6 +866,136 @@ mod tests {
                 "callbacks retained the split widget"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires GTK; exercised by xvfb-smoke-test.sh"]
+    fn restoring_split_respects_nested_pane_minimums() {
+        fn wait_for(condition: impl Fn() -> bool, failure: &str) {
+            let context = glib::MainContext::default();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !condition() {
+                assert!(std::time::Instant::now() < deadline, "{failure}");
+                while context.pending() {
+                    context.iteration(false);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        gtk::init().expect("initialize GTK");
+
+        let make_pane = || {
+            let pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            pane.set_size_request(-1, pane::MIN_PANE_HEIGHT);
+            pane
+        };
+        let nested_start = make_pane();
+        let nested_end = make_pane();
+        let nested = gtk::Paned::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .shrink_start_child(true)
+            .shrink_end_child(true)
+            .build();
+        nested.set_start_child(Some(&nested_start));
+        nested.set_end_child(Some(&nested_end));
+
+        let outer_end = make_pane();
+        let restored = gtk::Paned::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .shrink_start_child(true)
+            .shrink_end_child(true)
+            .build();
+        restored.set_start_child(Some(&nested));
+        restored.set_end_child(Some(&outer_end));
+        // Begin with the nested Paned below its handle size, as a tiny saved
+        // parent ratio can leave it before the restored ratios are applied.
+        restored.set_position(1);
+
+        let window = gtk::Window::new();
+        window.set_default_size(800, 700);
+        window.set_child(Some(&restored));
+        window.present();
+
+        wait_for(
+            || {
+                restored.is_mapped()
+                    && restored.height() > 0
+                    && nested.is_mapped()
+                    && nested.height() > 0
+            },
+            "split fixture did not receive a GTK allocation",
+        );
+
+        let handle_size = nested.measure(gtk::Orientation::Vertical, -1).0;
+        assert!(
+            handle_size > 0,
+            "GTK separator should have a measurable size"
+        );
+        assert!(
+            nested.height() <= handle_size,
+            "fixture should start with a nested Paned shorter than its handle"
+        );
+        let nested_minimum = pane::MIN_PANE_HEIGHT * 2 + handle_size;
+        let applying = Rc::new(Cell::new(false));
+        assert!(crate::window::apply_ratio_value(
+            &restored,
+            gtk::Orientation::Vertical,
+            0.1085,
+            &applying,
+        ));
+        assert!(
+            restored.position() >= nested_minimum,
+            "restoring a low ratio allocated {} px to a nested split with a {nested_minimum} px minimum",
+            restored.position()
+        );
+        assert!(
+            restored.max_position() - restored.position() >= pane::MIN_PANE_HEIGHT,
+            "restoring a low ratio left the outer end pane below its minimum"
+        );
+
+        wait_for(
+            || nested.height() == restored.position(),
+            "restored split position was not allocated to its nested child",
+        );
+
+        assert!(crate::window::apply_ratio_value(
+            &nested,
+            gtk::Orientation::Vertical,
+            0.1085,
+            &applying,
+        ));
+        assert!(
+            nested.position() >= pane::MIN_PANE_HEIGHT,
+            "restoring a low ratio left the nested start pane at {} px",
+            nested.position()
+        );
+        assert!(
+            nested.max_position() - nested.position() >= pane::MIN_PANE_HEIGHT,
+            "restoring a low ratio left the nested end pane below its minimum"
+        );
+
+        wait_for(
+            || {
+                nested_start.height() == nested.position()
+                    && nested_start.allocation().y() == 0
+                    && nested_end.height() >= pane::MIN_PANE_HEIGHT
+                    && nested_end.allocation().y() + nested_end.height() <= nested.height()
+                    && outer_end.height() >= pane::MIN_PANE_HEIGHT
+                    && outer_end.allocation().y() + outer_end.height() <= restored.height()
+            },
+            "restored split children did not fit their allocated bounds",
+        );
+        assert_eq!(
+            nested_start.allocation().y(),
+            0,
+            "restoring the inner split shifted its start pane out of view"
+        );
+        assert!(nested_start.height() >= pane::MIN_PANE_HEIGHT);
+        assert!(nested_end.height() >= pane::MIN_PANE_HEIGHT);
+        assert!(outer_end.height() >= pane::MIN_PANE_HEIGHT);
+
+        window.close();
     }
 
     #[test]

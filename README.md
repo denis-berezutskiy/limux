@@ -99,13 +99,13 @@ sudo apt install libgtk-4-dev libadwaita-1-dev libwebkitgtk-6.0-dev pkg-config b
 
 # Initialize the Ghostty submodule and build the embedded library
 git submodule update --init --recursive
-(cd ghostty && zig build -Dapp-runtime=none -Doptimize=ReleaseFast)
+./scripts/build-ghostty.sh
 
 # Build limux
 cargo build --release
 
 # Run (point to libghostty-internal.so location)
-LD_LIBRARY_PATH=../ghostty/zig-out/lib:$LD_LIBRARY_PATH ./target/release/limux
+LD_LIBRARY_PATH=ghostty/zig-out/lib:$LD_LIBRARY_PATH ./target/release/limux
 ```
 
 ### Package a release tarball
@@ -115,9 +115,17 @@ LD_LIBRARY_PATH=../ghostty/zig-out/lib:$LD_LIBRARY_PATH ./target/release/limux
 ```
 
 This builds the binary, bundles `libghostty-internal.so`, icons, and an install script into a tarball.
-`package.sh` also rebuilds `libghostty-internal.so` with `ReleaseFast` and `-Dcpu=baseline`, so Zig 0.16.0 and initialized Ghostty submodule must be present.
+`package.sh` uses `build-ghostty.sh` to rebuild `libghostty-internal.so` with `ReleaseFast` and `-Dcpu=baseline`, so Zig 0.16.0 and an initialized Ghostty submodule must be present.
 
 ## Development
+
+`build-ghostty.sh` records the clean Ghostty commit, library checksum, and resolved
+library path next to the artifact. The quality gate and GTK smoke tests reject
+missing or stale provenance before starting Cargo or a display session. After
+updating the submodule, rebuild with `./scripts/build-ghostty.sh`; linking an
+installed library into `ghostty/zig-out/lib` does not establish build provenance.
+Use `ZIG=/path/to/zig` to select Zig 0.16.0 and `LIMUX_BUILD_JOBS` to change the
+default four build jobs.
 
 Run the canonical local quality gate before committing:
 

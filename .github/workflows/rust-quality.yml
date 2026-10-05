@@ -76,9 +76,7 @@ jobs:
             pkg-config
 
       - name: Build libghostty for embedding
-        run: |
-          cd ghostty
-          zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline
+        run: ./scripts/build-ghostty.sh
 
       - name: Run repository quality checks
         run: ./scripts/check.sh
@@ -126,9 +124,7 @@ jobs:
             xvfb
 
       - name: Build libghostty for embedding
-        run: |
-          cd ghostty
-          zig build -Dapp-runtime=none -Doptimize=ReleaseFast -Dcpu=baseline
+        run: ./scripts/build-ghostty.sh
 
       - name: Run live GTK host smoke test
         env:

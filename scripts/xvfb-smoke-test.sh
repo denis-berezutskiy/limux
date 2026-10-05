@@ -12,6 +12,9 @@
 #     LIMUX_EXPECT_GL_RENDERER='RTX 5070 Ti' ./scripts/xvfb-smoke-test.sh
 set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+"$ROOT_DIR/scripts/check-ghostty.sh"
+
 PROFILE="${LIMUX_SMOKE_PROFILE:-release}"
 GRAPHICS="${LIMUX_SMOKE_GRAPHICS:-software}"
 CYCLES="${LIMUX_SMOKE_CYCLES:-10}"
@@ -94,7 +97,6 @@ SMOKE_DBUS
   fi
   exit "$result"
 fi
-ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT_DIR"
 
 DEMO_DIR="${LIMUX_SMOKE_RUN_DIR:?private smoke directory missing}"
@@ -391,16 +393,23 @@ for regression in \
   pane::tests::moved_tab_survives_either_pane_closing_before_the_next_frame \
   pane::tests::retired_pane_releases_its_tab_contents_after_a_frame \
   pane::tests::closing_the_active_tab_maps_only_its_replacement \
+  pane::tests::moved_terminal_hover_focus_reads_its_new_pane_and_spares_renames \
   split_tree::tests::split_ratio_callbacks_release_unmapped_paned \
+  split_tree::tests::restoring_split_respects_nested_pane_minimums \
   settings_editor::tests::interface_controls_restore_effective_values_after_save_failure \
   window::tests::hidden_workspace_path_does_not_reserve_sidebar_row_height \
   terminal::tests::submenu_popovers_never_grab \
+  terminal::tests::clipboard_toast_never_retains_its_terminal \
+  terminal::tests::repeated_copies_show_a_single_clipboard_toast \
+  terminal::tests::context_menu_never_retains_its_terminal \
+  terminal::tests::context_menu_the_compositor_refuses_is_detached \
   terminal::tests::detach_after_repaint_waits_for_a_frame_without_the_widget \
   window::pane_create_tests::pane_create_replies_once_the_new_pane_can_be_targeted \
+  window::pane_close_tests::closed_tabs_panes_and_workspaces_free_their_widgets \
   window::ssh_launch_tests::ssh_launch_is_explicit_and_not_persisted \
   window::ssh_launch_tests::persistent_ssh_restores_retries_moves_and_closes \
   window::tab_move_tests::moving_a_first_tab_to_another_workspace_keeps_tab_ids_unique; do
-  cargo test --locked $CARGO_FLAGS -p limux-host-linux "$regression" \
+  timeout -k 5s 30s cargo test --locked $CARGO_FLAGS -p limux-host-linux "$regression" \
     -- --exact --ignored --test-threads=1 --nocapture
 done
 start_host host
@@ -815,6 +824,34 @@ jq -e --arg surface "$LIFECYCLE_SURFACE" '.surfaces | any(.surface_id == $surfac
 BROWSER_SURFACE="$(jq -r '.surface_id' "$LOG_DIR/stage6c-browser.json")"
 wait_for_saved_tab "$BROWSER_SURFACE" '[.. | objects | select(.id? == $tab and .tab_kind? == "browser" and .uri? == "about:blank")] | length == 1'
 "$LIMUX_CLI" close-surface --workspace limux --surface "$BROWSER_SURFACE" >"$LOG_DIR/stage6c-browser-close.txt"
+
+# Exercise the production color bridge, including explicit and inherited scope.
+for color in red orange amber green teal blue purple pink none; do
+  "$LIMUX_CLI" set-workspace-color --workspace "$WORKSPACE_ID" "$color"
+  "$LIMUX_CLI" --json --id-format both list-workspaces >"$LOG_DIR/stage6c-colors.json"
+  jq -e --arg workspace "$WORKSPACE_ID" --arg color "$color" \
+    '.workspaces | any(.workspace_id == $workspace and .color == (if $color == "none" then null else $color end))' \
+    "$LOG_DIR/stage6c-colors.json" >/dev/null \
+    || { echo "FAIL: workspace color $color was not applied"; exit 1; }
+done
+if "$LIMUX_CLI" set-workspace-color --workspace "$WORKSPACE_ID" chartreuse \
+    >"$LOG_DIR/stage6c-invalid-color.txt" 2>&1; then
+  echo "FAIL: unsupported workspace color was accepted"
+  exit 1
+fi
+"$LIMUX_CLI" select-workspace --workspace "$OTHER_WORKSPACE"
+LIMUX_WORKSPACE_ID="$WORKSPACE_ID" "$LIMUX_CLI" set-workspace-color blue
+"$LIMUX_CLI" --json --id-format both list-workspaces >"$LOG_DIR/stage6c-color-env.json"
+jq -e --arg workspace "$WORKSPACE_ID" \
+  '.workspaces | any(.workspace_id == $workspace and .color == "blue")' \
+  "$LOG_DIR/stage6c-color-env.json" >/dev/null \
+  || { echo "FAIL: workspace color ignored LIMUX_WORKSPACE_ID"; exit 1; }
+LIMUX_WORKSPACE_ID="$OTHER_WORKSPACE" "$LIMUX_CLI" set-workspace-color --workspace "$WORKSPACE_ID" pink
+"$LIMUX_CLI" --json --id-format both list-workspaces >"$LOG_DIR/stage6c-color-scope.json"
+jq -e --arg workspace "$WORKSPACE_ID" --arg other "$OTHER_WORKSPACE" \
+  '(.workspaces | any(.workspace_id == $workspace and .color == "pink")) and (.workspaces | any(.workspace_id == $other and .color == null))' \
+  "$LOG_DIR/stage6c-color-scope.json" >/dev/null \
+  || { echo "FAIL: workspace color escaped the requested scope"; exit 1; }
 "$LIMUX_CLI" close-workspace --workspace "$OTHER_WORKSPACE" >"$LOG_DIR/stage6c-other-close.txt"
 wait_for_healthy_surfaces limux "$LOG_DIR/stage6c-final-health.json"
 echo "stage 6c: OK (scoped lifecycle, background focus, pins, and saved tab selection)"
@@ -850,6 +887,11 @@ start_host host-restart
 "$LIMUX_CLI" list-workspaces >"$LOG_DIR/stage8-workspaces.txt"
 grep -Fq "$RESTORED_WORKSPACE" "$LOG_DIR/stage8-workspaces.txt" \
   || { echo "FAIL: renamed workspace was not restored"; exit 1; }
+"$LIMUX_CLI" --json --id-format both list-workspaces >"$LOG_DIR/stage8-colors.json"
+jq -e --arg workspace "$WORKSPACE_ID" \
+  '.workspaces | any(.workspace_id == $workspace and .color == "pink")' \
+  "$LOG_DIR/stage8-colors.json" >/dev/null \
+  || { echo "FAIL: workspace color was not restored"; exit 1; }
 for _ in $(seq 1 50); do
   "$LIMUX_CLI" --json list-panes --workspace "$RESTORED_WORKSPACE" \
     >"$LOG_DIR/stage8-panes.json"

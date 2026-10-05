@@ -27,12 +27,7 @@ prepare() {
 
 build() {
     cd "$srcdir/$pkgname-$pkgver"
-    local zig_args=(-Doptimize=ReleaseFast -Dcpu=baseline -fno-sys=gtk4-layer-shell)
-
-    (
-        cd ghostty
-        zig build -Dapp-runtime=none "${zig_args[@]}"
-    )
+    ./scripts/build-ghostty.sh
 
     RUSTFLAGS="\
         -C link-arg=-Wl,-rpath,/usr/lib/limux \

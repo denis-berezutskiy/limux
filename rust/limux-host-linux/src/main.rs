@@ -16,6 +16,7 @@ mod ssh_hosts;
 mod ssh_session;
 mod terminal;
 mod window;
+mod workspace_color;
 
 use adw::prelude::*;
 use libadwaita as adw;

@@ -27,7 +27,6 @@ APP_ICONS_DIR="${ROOT_DIR}/rust/limux-host-linux/icons/app"
 DESKTOP_FILE="${ROOT_DIR}/rust/limux-host-linux/dev.limux.linux.desktop"
 METADATA_FILE="${ROOT_DIR}/rust/limux-host-linux/dev.limux.linux.metainfo.xml"
 OUT_DIR="${ROOT_DIR}/dist"
-GHOSTTY_ZIG_ARGS=(-Doptimize=ReleaseFast -Dcpu=baseline)
 CLI_ENTRYPOINT_NAME="limux"
 HOST_ENTRYPOINT_NAME="limux-host"
 
@@ -198,39 +197,17 @@ copy_ghostty_terminfo_entries() {
 
 . "${ROOT_DIR}/scripts/appimage-webkit.sh"
 
-configure_ghostty_build_args() {
-    if ! command -v pkg-config >/dev/null 2>&1 || ! pkg-config --exists gtk4-layer-shell-0; then
-        echo "gtk4-layer-shell not available via pkg-config; building Ghostty with bundled gtk4-layer-shell."
-        GHOSTTY_ZIG_ARGS+=(-fno-sys=gtk4-layer-shell)
-    fi
-}
-
 build_ghostty_resources() {
     echo "Staging Ghostty resources..."
     remove_tree "$GHOSTTY_INSTALL_ROOT"
-    mkdir -p "$GHOSTTY_INSTALL_ROOT"
-
-    (
-        cd "${ROOT_DIR}/ghostty"
-        DESTDIR="$GHOSTTY_INSTALL_ROOT" \
-            zig build \
-            --prefix /usr \
-            -Dapp-runtime=none \
-            "${GHOSTTY_ZIG_ARGS[@]}" \
-            -Demit-docs=false
-    )
+    mkdir -p "$GHOSTTY_INSTALL_ROOT/usr/share"
+    cp -a "${ROOT_DIR}/ghostty/zig-out/share/." "$GHOSTTY_INSTALL_ROOT/usr/share/"
 }
 
 echo "=== Limux Packager ==="
 echo "Version: ${VERSION}"
 echo "Arch:    ${ARCH}"
 echo "GLIBC:   <= ${MAX_GLIBC_VERSION}"
-
-if ! command -v zig >/dev/null 2>&1; then
-    echo "ERROR: zig not found in PATH."
-    echo "Install Zig, then rerun ./scripts/package.sh"
-    exit 1
-fi
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "ERROR: python3 not found in PATH."
@@ -247,9 +224,8 @@ fi
 # Always build libghostty with ReleaseFast to guarantee optimized output.
 # Pinning cpu=baseline keeps the shipped library portable across x86_64 CPUs
 # that do not expose the builder's ISA extensions, such as AVX-512.
-configure_ghostty_build_args
 echo "Building libghostty (ReleaseFast, cpu=baseline)..."
-(cd "${ROOT_DIR}/ghostty" && zig build -Dapp-runtime=none "${GHOSTTY_ZIG_ARGS[@]}")
+"$ROOT_DIR/scripts/build-ghostty.sh"
 build_ghostty_resources
 
 if [ ! -f "$GHOSTTY_SO" ]; then

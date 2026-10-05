@@ -187,6 +187,9 @@ pub fn retire_pane(pane_widget: &gtk::Widget) {
     };
     let internals = unsafe { outer.steal_data::<Rc<PaneInternals>>("limux-pane-internals") };
     if let Some(internals) = internals {
+        // As in remove_tab: an open rename entry and the tab's label box hold
+        // each other until the rename commits.
+        commit_active_tab_rename(&internals.tab_state);
         let entries = {
             let mut tab_state = internals.tab_state.borrow_mut();
             tab_state.active_tab = None;
@@ -653,31 +656,41 @@ pub fn create_pane(
             }
         });
     }
+    // Handlers owned by the pane's own widgets hold it weakly: a strong ref
+    // would keep a closed pane alive forever.
     {
-        let internals = internals.clone();
+        let pane_widget = outer.downgrade();
         new_browser_btn.connect_clicked(move |_| {
-            add_browser_tab_inner(&internals, None);
+            if let Some(pane_widget) = pane_widget.upgrade() {
+                add_browser_tab_to_pane(&pane_widget.upcast());
+            }
         });
     }
     {
-        let pw = outer.clone();
+        let pw = outer.downgrade();
         let cb = callbacks.clone();
         split_h_btn.connect_clicked(move |_| {
-            (cb.on_split)(&pw.clone().upcast(), gtk::Orientation::Horizontal);
+            if let Some(pw) = pw.upgrade() {
+                (cb.on_split)(&pw.upcast(), gtk::Orientation::Horizontal);
+            }
         });
     }
     {
-        let pw = outer.clone();
+        let pw = outer.downgrade();
         let cb = callbacks.clone();
         split_v_btn.connect_clicked(move |_| {
-            (cb.on_split)(&pw.clone().upcast(), gtk::Orientation::Vertical);
+            if let Some(pw) = pw.upgrade() {
+                (cb.on_split)(&pw.upcast(), gtk::Orientation::Vertical);
+            }
         });
     }
     {
-        let pw = outer.clone();
+        let pw = outer.downgrade();
         let cb = callbacks.clone();
         close_btn.connect_clicked(move |_| {
-            (cb.on_close_pane)(&pw.clone().upcast());
+            if let Some(pw) = pw.upgrade() {
+                (cb.on_close_pane)(&pw.upcast());
+            }
         });
     }
     install_tab_strip_drop_target(&tab_overlay, &internals);
@@ -1406,6 +1419,31 @@ fn make_terminal_callbacks(
                 }
             }
         }),
+        hover_focus: Box::new({
+            let callbacks = internals.callbacks.clone();
+            let pane_outer = internals.pane_outer.clone();
+            move || {
+                let config = (callbacks.current_config)();
+                let hover_focus = config.borrow().focus.hover_terminal_focus;
+                // A rename in any pane of the window blocks it: losing the
+                // focus commits the half-typed name.
+                hover_focus
+                    && !pane_outer
+                        .root()
+                        .and_then(|root| root.focus())
+                        .and_then(|focus| focus.ancestor(gtk::Entry::static_type()))
+                        .is_some_and(|entry| entry.has_css_class(TAB_RENAME_ENTRY_CSS_CLASS))
+            }
+        }),
+        copy_selection_to_clipboard: Box::new({
+            let callbacks = internals.callbacks.clone();
+            move || {
+                let config = (callbacks.current_config)();
+                let copy_selection_to_clipboard =
+                    config.borrow().clipboard.copy_selection_to_clipboard;
+                copy_selection_to_clipboard
+            }
+        }),
     }
 }
 
@@ -1523,29 +1561,10 @@ fn build_terminal_widget(
     initial_input: Option<String>,
 ) -> terminal::TerminalWidget {
     let term_callbacks = make_terminal_callbacks(internals, tab_id, title_label, term_cwd);
-    let hover_focus = {
-        let callbacks = internals.callbacks.clone();
-        let tab_state = internals.tab_state.clone();
-        Rc::new(move || {
-            let config = (callbacks.current_config)();
-            let hover_focus = config.borrow().focus.hover_terminal_focus;
-            hover_focus && !tab_rename_active(&tab_state)
-        })
-    };
-    let copy_selection_to_clipboard = {
-        let callbacks = internals.callbacks.clone();
-        Rc::new(move || {
-            let config = (callbacks.current_config)();
-            let copy_selection_to_clipboard = config.borrow().clipboard.copy_selection_to_clipboard;
-            copy_selection_to_clipboard
-        })
-    };
     let extra_env = build_terminal_env(internals, tab_id);
     terminal::create_terminal(
         working_directory,
         terminal::TerminalOptions {
-            hover_focus,
-            copy_selection_to_clipboard,
             saved_font_size: (internals.callbacks.current_config)().borrow().font_size,
             startup_command,
             initial_input,
@@ -2737,9 +2756,12 @@ fn build_tab_button_from_label(
         let tab_state = internals.tab_state.clone();
         let callbacks = internals.callbacks.clone();
         let pane_widget = internals.pane_outer.downgrade();
-        let tab_button = tab_btn.clone();
+        let tab_button = tab_btn.downgrade();
         let label = label.clone();
         click.connect_pressed(move |gesture, n_press, _, _| {
+            let Some(tab_button) = tab_button.upgrade() else {
+                return;
+            };
             if handle_tab_interaction_while_renaming(&tab_button, &tab_state) {
                 gesture.set_state(gtk::EventSequenceState::Denied);
                 return;
@@ -2782,9 +2804,12 @@ fn build_tab_button_from_label(
             label: label.clone(),
             pin_icon: pin_icon.clone(),
         };
-        let tab_button = tab_btn.clone();
+        let tab_button = tab_btn.downgrade();
         let tab_state = internals.tab_state.clone();
         right_click.connect_pressed(move |gesture, _, _, _| {
+            let Some(tab_button) = tab_button.upgrade() else {
+                return;
+            };
             if handle_tab_interaction_while_renaming(&tab_button, &tab_state) {
                 gesture.set_state(gtk::EventSequenceState::Denied);
                 return;
@@ -2895,11 +2920,13 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
         let lbl = context.label.clone();
         let state = context.tab_state.clone();
         let tid = tab_id.to_string();
-        let menu_ref = menu.clone();
+        let menu_ref = menu.downgrade();
         let callbacks = context.callbacks.clone();
         let tab_strip = context.tab_strip.clone();
         rename_btn.connect_clicked(move |_| {
-            menu_ref.popdown();
+            if let Some(menu) = menu_ref.upgrade() {
+                menu.popdown();
+            }
             let tab_strip = tab_strip.clone();
             let lbl = lbl.clone();
             let state = state.clone();
@@ -2926,10 +2953,12 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
         let tid = tab_id.to_string();
         let pin = context.pin_icon.clone();
         let close = tab_btn.last_child(); // close button
-        let menu_ref = menu.clone();
+        let menu_ref = menu.downgrade();
         let callbacks = context.callbacks.clone();
         pin_btn.connect_clicked(move |_| {
-            menu_ref.popdown();
+            if let Some(menu) = menu_ref.upgrade() {
+                menu.popdown();
+            }
             let mut ts = state.borrow_mut();
             if let Some(entry) = ts.find_tab_mut(&tid) {
                 entry.pinned = !entry.pinned;
@@ -2955,9 +2984,11 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
         let state = context.tab_state.clone();
         let cb = context.callbacks.clone();
         let po = context.pane_outer.clone();
-        let menu_ref = menu.clone();
+        let menu_ref = menu.downgrade();
         close_btn.connect_clicked(move |_| {
-            menu_ref.popdown();
+            if let Some(menu) = menu_ref.upgrade() {
+                menu.popdown();
+            }
             remove_tab(
                 &ts,
                 &cs,
@@ -2977,9 +3008,17 @@ fn show_tab_context_menu(tab_btn: &gtk::Box, tab_id: &str, context: &TabContextM
     menu.set_parent(tab_btn);
     menu.set_has_arrow(false);
 
-    // Clean up popover when it closes
+    // Clean up popover when it closes. With the focus still on an item, the
+    // unparent would leak it (see `terminal::unset_focus_within`), so the
+    // focus goes back to the pane's active tab instead.
+    let pane_widget = context.pane_outer.downgrade();
     menu.connect_closed(move |popover| {
+        let had_focus = crate::terminal::focus_is_within(popover.upcast_ref());
+        crate::terminal::unset_focus_within(popover.upcast_ref());
         popover.unparent();
+        if let Some(pane_widget) = pane_widget.upgrade().filter(|_| had_focus) {
+            focus_active_tab_in_pane(pane_widget.upcast_ref());
+        }
     });
 
     menu.popup();
@@ -3547,10 +3586,13 @@ fn install_tab_strip_drop_target(tab_overlay: &gtk::Overlay, internals: &Rc<Pane
         });
     }
     {
-        let target = internals.clone();
+        let target = Rc::downgrade(internals);
         let indicator = internals.drop_indicator.clone();
         drop_target.connect_drop(move |_, value, x, _| {
             indicator.set_visible(false);
+            let Some(target) = target.upgrade() else {
+                return false;
+            };
             let Ok(raw) = value.get::<String>() else {
                 return false;
             };
@@ -3601,11 +3643,16 @@ fn set_browser_targeting_enabled(content_stack: &gtk::Stack, enabled: bool) {
 fn install_content_drop_target(internals: &Rc<PaneInternals>) {
     let drop_target = gtk::DropTarget::new(glib::Type::STRING, gtk::gdk::DragAction::MOVE);
     drop_target.set_preload(true);
+    // The controller is on content_stack: its handlers hold it and the pane
+    // weakly.
     {
         let overlay = internals.content_drop_overlay.clone();
-        let content_stack = internals.content_stack.clone();
+        let content_stack = internals.content_stack.downgrade();
         let workspace_dragging = internals.workspace_dragging.clone();
         drop_target.connect_motion(move |_, x, y| {
+            let Some(content_stack) = content_stack.upgrade() else {
+                return gtk::gdk::DragAction::empty();
+            };
             if workspace_dragging.get() || !is_tab_dragging() {
                 clear_content_drop_zone(&overlay);
                 return gtk::gdk::DragAction::empty();
@@ -3634,11 +3681,13 @@ fn install_content_drop_target(internals: &Rc<PaneInternals>) {
         });
     }
     {
-        let target = internals.clone();
+        let target = Rc::downgrade(internals);
         let overlay = internals.content_drop_overlay.clone();
-        let content_stack = internals.content_stack.clone();
         drop_target.connect_drop(move |_, value, x, y| {
             clear_content_drop_zone(&overlay);
+            let Some(target) = target.upgrade() else {
+                return false;
+            };
             let Ok(raw) = value.get::<String>() else {
                 return false;
             };
@@ -3648,8 +3697,8 @@ fn install_content_drop_target(internals: &Rc<PaneInternals>) {
             let Some((width, height)) = effective_drop_target_dimensions(
                 overlay.width(),
                 overlay.height(),
-                content_stack.allocation().width(),
-                content_stack.allocation().height(),
+                target.content_stack.allocation().width(),
+                target.content_stack.allocation().height(),
             ) else {
                 return false;
             };
@@ -3803,7 +3852,6 @@ fn remove_tab(
     tab_strip.remove(&entry.tab_button);
 
     let Some(new_id) = new_id else {
-        crate::terminal::remove_from_stack_after_repaint(&entry.content);
         if removed_was_unread {
             (callbacks.on_unread_changed)();
         }
@@ -3812,7 +3860,11 @@ fn remove_tab(
         } else {
             empty_reason
         };
+        // Closing the pane first lets its successor, or the workspace that
+        // replaces its own, take the focus from the content before the
+        // content hides (see `terminal::unset_focus_within`).
         (callbacks.on_empty)(&pane_outer.clone().upcast(), empty_reason);
+        crate::terminal::remove_from_stack_after_repaint(&entry.content);
         return;
     };
 
@@ -5327,6 +5379,168 @@ mod tests {
             internals.content_stack.visible_child_name().as_deref(),
             Some(replacement_id.as_str())
         );
+
+        window.close();
+    }
+
+    // A moved terminal must read hover focus from its new pane, and hovering
+    // it must not take the focus from a tab rename in any pane: losing the
+    // focus commits the half-typed name.
+    #[test]
+    #[ignore = "requires a graphical display and Ghostty resources"]
+    fn moved_terminal_hover_focus_reads_its_new_pane_and_spares_renames() {
+        use super::{
+            add_keybind_editor_tab_to_pane, commit_active_tab_rename, create_pane,
+            find_pane_internals, find_tab_rename_entry, glib, move_tab_to_pane, show_rename_dialog,
+            PaneCallbacks,
+        };
+        use crate::app_config::AppConfig;
+        use gtk::prelude::*;
+        use gtk4 as gtk;
+        use std::cell::{Cell, RefCell};
+        use std::rc::Rc;
+
+        crate::prepare_ghostty_runtime();
+        gtk::init().expect("GTK display required");
+        crate::terminal::init_ghostty();
+        let context = glib::MainContext::default();
+        let shortcuts = Rc::new(default_shortcuts());
+        let callbacks = |hover_terminal_focus: bool| {
+            let shortcuts = shortcuts.clone();
+            let mut config = AppConfig::default();
+            config.focus.hover_terminal_focus = hover_terminal_focus;
+            let config = Rc::new(RefCell::new(config));
+            Rc::new(PaneCallbacks {
+                workspace_id: "test".to_string(),
+                autostart_command: Rc::default(),
+                suppress_next_autostart: Cell::new(false),
+                initial_command: RefCell::new(None),
+                on_split: Box::new(|_, _| {}),
+                on_close_pane: Box::new(|_| {}),
+                on_bell: Box::new(|_, _, _| {}),
+                on_desktop_notification: Box::new(|_, _, _, _, _| {}),
+                on_open_browser_here: Box::new(|_| {}),
+                on_open_url_in_browser: Box::new(|_, _| {}),
+                on_open_keybinds: Box::new(|_| {}),
+                current_shortcuts: Box::new(move || shortcuts.clone()),
+                on_capture_shortcut: Rc::new(|_, _| Err(String::new())),
+                on_pwd_changed: Box::new(|_| {}),
+                on_empty: Box::new(|_, _| {}),
+                on_state_changed: Box::new(|| {}),
+                on_unread_changed: Box::new(|| {}),
+                is_pane_visible: Box::new(|_| true),
+                on_split_with_tab: Box::new(|_, _, _, _, _| {}),
+                current_config: Box::new(move || config.clone()),
+                workspace_for_pane: Box::new(|_| None),
+            })
+        };
+        let wait_until = |what: &str, done: &dyn Fn() -> bool| {
+            let timeout = std::time::Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + timeout;
+            // Wakes the blocking iteration below if nothing else does.
+            glib::timeout_add_local_once(timeout, || {});
+            while !done() {
+                assert!(std::time::Instant::now() < deadline, "{what}");
+                context.iteration(true);
+            }
+        };
+        let add_renameable_tab = |pane: &gtk::Box| {
+            add_keybind_editor_tab_to_pane(
+                pane.upcast_ref(),
+                shortcuts.clone(),
+                Rc::new(|_, _| Err(String::new())),
+            );
+        };
+
+        // Only the new pane's config enables hover focus.
+        let source = create_pane(callbacks(false), shortcuts.clone(), None, None, true);
+        let target = create_pane(callbacks(true), shortcuts.clone(), None, None, true);
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        row.append(&source);
+        row.append(&target);
+        let window = gtk::Window::builder().child(&row).build();
+        window.present();
+        super::add_terminal_tab_to_pane(source.upcast_ref());
+
+        let source_state = find_pane_internals(source.upcast_ref()).unwrap();
+        let target_state = find_pane_internals(target.upcast_ref()).unwrap();
+        let (moved_id, moved_content) = {
+            let tabs = source_state.tab_state.borrow();
+            (tabs.tabs[0].id.clone(), tabs.tabs[0].content.clone())
+        };
+        let mut widgets = vec![moved_content.clone()];
+        let gl_area = std::iter::from_fn(|| {
+            let widget = widgets.pop()?;
+            let mut child = widget.first_child();
+            while let Some(current) = child {
+                child = current.next_sibling();
+                widgets.push(current);
+            }
+            Some(widget)
+        })
+        .find_map(|widget| widget.downcast::<gtk::GLArea>().ok())
+        .expect("terminal GLArea");
+        let hover = || {
+            let controllers = gl_area.observe_controllers();
+            for motion in (0..controllers.n_items())
+                .filter_map(|index| controllers.item(index))
+                .filter_map(|item| item.downcast::<gtk::EventControllerMotion>().ok())
+            {
+                motion.emit_by_name::<()>("enter", &[&1.0f64, &1.0f64]);
+            }
+        };
+        let focused_entry = || {
+            GtkWindowExt::focus(&window).and_then(|focus| focus.ancestor(gtk::Entry::static_type()))
+        };
+        wait_until("the terminal never mapped", &|| moved_content.is_mapped());
+        add_renameable_tab(&source);
+        add_renameable_tab(&target);
+
+        assert!(move_tab_to_pane(
+            source.upcast_ref(),
+            &moved_id,
+            target.upcast_ref()
+        ));
+        wait_until("the moved terminal never mapped in its new pane", &|| {
+            gl_area.is_mapped()
+                && moved_content.parent() == Some(target_state.content_stack.clone().upcast())
+        });
+
+        GtkWindowExt::set_focus(&window, gtk::Widget::NONE);
+        hover();
+        assert_eq!(
+            GtkWindowExt::focus(&window),
+            Some(gl_area.clone().upcast()),
+            "the moved terminal still reads hover focus from its old pane"
+        );
+
+        for (pane, state) in [("new", &target_state), ("old", &source_state)] {
+            let (renamed_id, renamed_label) = {
+                let tabs = state.tab_state.borrow();
+                let tab = tabs.tabs.iter().find(|tab| tab.id != moved_id).unwrap();
+                (tab.id.clone(), tab.title_label.clone())
+            };
+            show_rename_dialog(
+                &state.tab_strip,
+                &renamed_label,
+                &state.tab_state,
+                &renamed_id,
+                &state.callbacks,
+            );
+            let entry = find_tab_rename_entry(&state.tab_strip).expect("rename entry");
+            assert_eq!(
+                focused_entry(),
+                Some(entry.clone().upcast()),
+                "the rename in the terminal's {pane} pane never got the focus"
+            );
+            hover();
+            assert_eq!(
+                focused_entry(),
+                Some(entry.upcast()),
+                "hover took the focus from a rename in the terminal's {pane} pane"
+            );
+            assert!(commit_active_tab_rename(&state.tab_state));
+        }
 
         window.close();
     }

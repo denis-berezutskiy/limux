@@ -236,7 +236,10 @@ pub(super) unsafe extern "C" fn ghostty_write_clipboard_cb(
     let Some(identity) = (unsafe { identity_from_userdata(userdata) }) else {
         return;
     };
-    let policy = clipboard_write_policy(clipboard_type, (context.copy_selection_to_clipboard)());
+    let policy = clipboard_write_policy(
+        clipboard_type,
+        (context.callbacks.borrow().copy_selection_to_clipboard)(),
+    );
     if confirm {
         ask_consent(
             identity,
